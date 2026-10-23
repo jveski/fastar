@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Target compiler – fastar</title>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      .drop { display: block; border: 2px dashed var(--border); border-radius: 10px; padding: 32px 16px; text-align: center; cursor: pointer; margin: 24px 0 12px; }
+      .drop.over { border-color: var(--accent); background: var(--soft); }
+      .drop input { display: none; }
+      #images { list-style: none; padding: 0; margin: 0; }
+      #images li { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+      #images img { width: 64px; height: 48px; object-fit: contain; background: var(--soft); border-radius: 4px; flex: none; }
+      #images .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #images input { width: 5.5em; }
+      #images .remove { background: none; color: var(--muted); padding: 4px 8px; }
+      .target { margin: 24px 0; }
+      .target p { margin: 0 0 8px; }
+      .target canvas { width: 100%; height: auto; border-radius: 6px; display: block; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="https://github.com/jveski/fastar">fastar</a>
+      <a href="compile.html" aria-current="page">Compiler</a>
+      <a href="demo/">Demo</a>
+    </header>
+    <main>
+      <h1>Target compiler</h1>
+      <p class="muted">
+        Turn images into a <code>targets.bin</code>. Enter the width each image will be printed or shown at, so
+        poses come out in metres. Runs in your browser; nothing is uploaded.
+      </p>
+
+      <label class="drop" id="drop">
+        <input id="files" type="file" accept="image/*" multiple />
+        <strong>Choose images</strong> <span class="muted">or drop them here</span>
+      </label>
+      <ul id="images"></ul>
+
+      <div class="row">
+        <button id="compile" disabled>Compile</button>
+        <span id="status" class="muted"></span>
+      </div>
+
+      <section id="result" hidden>
+        <div class="row">
+          <a id="download" class="button" download="targets.bin">Download targets.bin</a>
+          <a id="try" class="button secondary" target="_blank" rel="noopener">Try it in the demo</a>
+        </div>
+        <p class="muted">Orange circles are detection features, teal squares are tracking points. Both should cover the image evenly.</p>
+        <div id="targets"></div>
+      </section>
+    </main>
+    <script type="module" src="compile.js"></script>
+  </body>
+</html>

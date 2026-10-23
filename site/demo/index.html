@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Demo – fastar</title>
+    <link rel="stylesheet" href="../style.css" />
+    <style>
+      #target { width: 100%; display: block; border-radius: 6px; border: 1px solid var(--border); }
+      #ar { display: none; }
+      body.running { background: #000; overflow: hidden; }
+      body.running header, body.running main { display: none; }
+      body.running #ar { display: block; }
+      #video, #gl { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      #stop { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: 12px; }
+      #status { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); color: #fff; font: 13px system-ui, sans-serif; text-shadow: 0 0 3px #000; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <header>
+      <a href="https://github.com/jveski/fastar">fastar</a>
+      <a href="../compile.html">Compiler</a>
+      <a href="./" aria-current="page">Demo</a>
+    </header>
+    <main>
+      <h1>Demo</h1>
+      <p id="intro" class="muted">
+        A cube on an image. On your phone, tap Start and point the camera at the image below, shown on another screen
+        or printed 20 cm wide.
+      </p>
+      <div class="row">
+        <button id="start" disabled>Start</button>
+        <span id="error" class="warn"></span>
+      </div>
+      <img id="target" src="target.png" alt="Demo target image" />
+      <p class="muted">
+        <a href="https://github.com/jveski/fastar/blob/main/site/demo/index.html">View this page's source</a>
+        for a complete example.
+      </p>
+    </main>
+
+    <div id="ar">
+      <video id="video" muted playsinline></video>
+      <canvas id="gl"></canvas>
+      <button id="stop" class="secondary">Stop</button>
+      <div id="status"></div>
+    </div>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter } from '../fastar.js';
+
+      const $ = (id) => document.getElementById(id);
+
+      // ?targets=<url> loads another targets file (the compiler links here with its output).
+      const custom = new URLSearchParams(location.search).get('targets');
+      if (custom) {
+        $('intro').textContent = 'Your compiled targets. Tap Start and point the camera at your image, shown on another screen or printed at the width you entered.';
+        $('target').remove();
+      }
+
+      const canvas = $('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+
+      const ar = await ImageTracker.create({ targets: custom ?? './targets.bin' }).catch((err) => {
+        $('error').textContent = `Could not load the targets: ${err.message}`;
+        throw err;
+      });
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        // With syncDisplay the camera frame is drawn as scene.background, so the cube
+        // and the picture always come from the same frame.
+        render: () => {
+          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          renderer.render(scene, camera);
+        },
+      });
+      // Target units are metres, origin at the target centre, z out of the image.
+      ar.targets.forEach((target, i) => {
+        const size = target.physicalWidth / 3;
+        const cube = new THREE.Mesh(new THREE.BoxGeometry(size, size, size), new THREE.MeshStandardMaterial({ color: 0x2d7ff9 }));
+        cube.position.z = size / 2;
+        three.anchor(i).add(cube);
+      });
+
+      let timer = 0;
+      $('start').disabled = false;
+      $('start').onclick = async () => {
+        $('error').textContent = '';
+        document.body.classList.add('running');
+        try {
+          // Called first thing in the tap: iOS only shows the motion prompt from a user gesture.
+          await ar.start({ video: $('video'), requestMotionPermission: true, syncDisplay: true });
+        } catch (err) {
+          document.body.classList.remove('running');
+          $('error').textContent = err.message;
+          throw err;
+        }
+        timer = setInterval(() => {
+          const s = ar.stats;
+          const tracking = s.targets.length > 0;
+          const hint = s.sensors !== 'none' && !s.tdCalibrated ? ' · move the phone around to calibrate' : '';
+          $('status').textContent = (tracking ? 'Tracking' : 'Looking for the image…') + hint;
+        }, 250);
+      };
+
+      $('stop').onclick = () => {
+        ar.stop();
+        clearInterval(timer);
+        $('status').textContent = '';
+        document.body.classList.remove('running');
+      };
+    </script>
+  </body>
+</html>

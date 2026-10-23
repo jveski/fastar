@@ -1,0 +1,61 @@
+{
+  "name": "fastar",
+  "version": "0.1.0",
+  "description": "Web image-target AR with inertial fusion",
+  "keywords": [
+    "ar",
+    "augmented-reality",
+    "image-tracking",
+    "image-target",
+    "webar",
+    "computer-vision",
+    "imu",
+    "sensor-fusion",
+    "three.js",
+    "aframe"
+  ],
+  "license": "MIT",
+  "author": "Jordan Olshevski",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/fastar.js",
+  "module": "./dist/fastar.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/fastar.js"
+    }
+  },
+  "bin": {
+    "fastar-compile": "./dist/fastar-compile.js"
+  },
+  "files": [
+    "dist/fastar.js",
+    "dist/fastar-compile.js",
+    "dist/types"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "bench": "tsx bench/bench.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "sim": "tsx scripts/sim.ts",
+    "replay": "tsx scripts/replay.ts",
+    "compile": "tsx cli/compile.ts",
+    "example:target": "tsx scripts/example-target.ts",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "jpeg-js": "^0.4.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.7"
+  }
+}

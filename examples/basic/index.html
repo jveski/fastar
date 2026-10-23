@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>fastar – minimal example</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+      video, canvas { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      button { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 14px 22px; font: 16px system-ui; }
+      #status { position: fixed; left: 8px; right: 8px; bottom: 8px; margin: 0; color: #fff; font: 12px ui-monospace, monospace; white-space: pre-wrap; text-shadow: 0 0 3px #000; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <video id="video" muted playsinline></video>
+    <canvas id="gl"></canvas>
+    <button id="start">Start AR</button>
+    <pre id="status"></pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter } from '../../dist/fastar.js';
+
+      const canvas = document.getElementById('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+
+      const ar = await ImageTracker.create({ targets: './targets.bin' });
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        // Called once per camera frame. With syncDisplay the frame itself is drawn as
+        // scene.background, so the cube and the picture always come from the same frame.
+        render: () => {
+          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          renderer.render(scene, camera);
+        },
+      });
+
+      // Target units are metres; origin at the target centre, z out of the page.
+      const cube = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0x2d7ff9 }));
+      cube.position.z = 0.03;
+      three.anchor(0).add(cube);
+
+      ar.on('found', () => console.log('target found'));
+      ar.on('lost', () => console.log('target lost'));
+
+      const status = document.getElementById('status');
+      document.getElementById('start').onclick = async (e) => {
+        e.target.remove();
+        const video = document.getElementById('video');
+        try {
+          // syncDisplay: show each camera frame once it has been tracked, with the pose
+          // measured on it, instead of the live <video> with a predicted pose.
+          await ar.start({ video, requestMotionPermission: true, syncDisplay: true });
+        } catch (err) {
+          status.textContent = String(err);
+          throw err;
+        }
+        // Tracker state, so you can tell "not found yet" from "not running".
+        setInterval(() => {
+          const s = ar.stats;
+          const imu = s.sensors === 'none'
+            ? `no motion sensors (${s.motionPermission})`
+            : s.tdCalibrated ? 'imu calibrated' : 'imu calibrating (move the phone)';
+          const t = s.targets.map((r) => `${r.status}, confidence ${r.confidence.toFixed(2)}`).join('; ') || 'searching';
+          status.textContent = `${s.fps} fps | ${imu} | ${t}`;
+        }, 250);
+      };
+    </script>
+  </body>
+</html>

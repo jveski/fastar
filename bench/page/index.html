@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>fastar benchmark</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; color: #eee; font: 12px/1.35 ui-monospace, Menlo, monospace; overflow: hidden; }
+      #stage { position: fixed; inset: 0; }
+      video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      #panel { position: fixed; left: 8px; top: 8px; right: 8px; pointer-events: none; }
+      #stats { background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px; white-space: pre; display: inline-block; }
+      #plots { display: block; margin-top: 6px; background: rgba(0,0,0,.55); border-radius: 6px; }
+      #controls { position: fixed; bottom: calc(12px + env(safe-area-inset-bottom)); left: 0; right: 0; text-align: center; }
+      button, label.btn { font: inherit; padding: 10px 14px; margin: 4px; border-radius: 8px; border: 0; background: #2d7ff9; color: #fff; }
+      label.btn input { display: none; }
+      #setup { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+      .hidden { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <video id="video" muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="panel" class="hidden">
+      <div id="stats"></div>
+      <canvas id="plots" width="320" height="120"></canvas>
+    </div>
+    <div id="setup">
+      <div>fastar on-device benchmark</div>
+      <label class="btn">Targets file (.bin)<input id="targetsFile" type="file" accept=".bin,application/octet-stream" /></label>
+      <label class="btn">…or compile an image<input id="imageFile" type="file" accept="image/*" /></label>
+      <div>physical width (m): <input id="width" value="0.21" size="5" style="pointer-events:auto" /></div>
+      <button id="start">Start (uses ./targets.bin if none chosen)</button>
+      <div id="msg"></div>
+    </div>
+    <div id="controls" class="hidden">
+      <button id="rec">Record</button>
+      <button id="recLuma">Record + luma</button>
+    </div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
