@@ -8,6 +8,7 @@ import { ippe, type IppeSolution } from '../vision/ippe';
 import { PoseSolver } from '../vision/pose';
 import type { Intrinsics } from '../vision/camera';
 import type { TargetData } from '../target/format';
+import { keyframeSpan } from '../target/video';
 import { Rng } from '../math/rng';
 
 export interface AcquireResult {
@@ -23,6 +24,17 @@ export interface AcquireResult {
   /** Pose covariance from the solver (6x6, [dtheta, dt]). */
   cov: Float64Array;
   timings: { features: number; match: number; total: number };
+  /** Target feature index of each inlier. */
+  tid?: Int32Array;
+  /** Video targets: when the matched content is on screen. */
+  time?: AcquireTime;
+}
+
+export interface AcquireTime {
+  /** Keyframe the match was made against. */
+  keyframe: number;
+  /** Video-time intervals [start, end) in seconds, flattened; end may pass the clip duration (loop). */
+  ranges: number[];
 }
 
 export interface AcquireOptions {
@@ -43,12 +55,18 @@ export class Acquirer {
   private readonly blurTmp: Uint16Array;
   private readonly det: FastDetector;
   private readonly searcher = new KmTreeSearcher(40);
+  /** Video targets hold features from many keyframes: search a little deeper. */
+  private readonly videoSearcher = new KmTreeSearcher(80);
+  private readonly covisibleFns = new WeakMap<TargetData, (a: number, b: number) => boolean>();
   private readonly rng = new Rng(77);
   private readonly solver = new PoseSolver(4096);
   // Match buffers.
   private readonly mq = new Int32Array(4096);
   private readonly mt = new Int32Array(4096);
   private readonly mquality = new Float32Array(4096);
+  private readonly allQ = new Int32Array(4096);
+  private readonly allT = new Int32Array(4096);
+  private readonly allQuality = new Float32Array(4096);
   /** Per-level FAST thresholds, adapted toward 3-10x the needed corner count. */
   readonly thresholds = new Int32Array([20, 20, 20, 20]);
 
@@ -101,18 +119,107 @@ export class Acquirer {
   matchTarget(ti: number, o: AcquireOptions = {}): AcquireResult | null {
     const T = this.targets[ti];
     const f = this.features;
-    const fkp = f.kp, fdesc = f.desc;
+    const fdesc = f.desc;
     const { mq, mt, mquality } = this;
-    // 1. Tree search + ratio test.
+    // 1. Tree search + ratio test. A video's look-alike from another time
+    // is usually the same content after it moved, not an ambiguity: keyframe
+    // voting sorts out which time matches, so only features that can be on
+    // screen together compete in the ratio test.
+    const searcher = T.video ? this.videoSearcher : this.searcher;
+    const covisible = T.video ? this.covisibility(T) : undefined;
     let nm = 0;
     for (let q = 0; q < f.count && nm < mq.length; q++) {
-      const b = this.searcher.search(T.tree, T.desc, T.kp, fdesc, 8 * q);
+      const b = searcher.search(T.tree, T.desc, T.kp, fdesc, 8 * q, undefined, covisible);
       if (b < 0) continue;
-      const d1 = this.searcher.dist1, d2 = this.searcher.dist2;
+      const d1 = searcher.dist1, d2 = searcher.dist2;
       if (d1 > MAX_DIST || d1 >= RATIO * d2) continue;
       mq[nm] = q; mt[nm] = b; mquality[nm] = d1 / Math.max(1, d2);
       nm++;
     }
+    if (nm < MIN_INLIERS) return null;
+    if (T.video) return this.matchVideo(ti, T, nm, o);
+    return this.fromMatches(ti, T, nm, o, -1);
+  }
+
+  /**
+   * Video: vote for the keyframe the matches agree on (each feature votes for
+   * every keyframe it was seen in), then match against that keyframe's
+   * features only. Tries the runner-up keyframe if the best one fails.
+   */
+  private matchVideo(ti: number, T: TargetData, nm: number, o: AcquireOptions): AcquireResult | null {
+    const meta = T.meta.video!, nk = meta.keyframes.length, range = T.video!.featureRange;
+    const votes = new Int32Array(nk + 1);
+    for (let m = 0; m < nm; m++) addRange(votes, nk, range[2 * this.mt[m]], range[2 * this.mt[m] + 1], 1);
+    for (let k = 1; k < nk; k++) votes[k] += votes[k - 1];
+    let kb = 0;
+    for (let k = 1; k < nk; k++) if (votes[k] > votes[kb]) kb = k;
+    let kb2 = -1;
+    for (let k = 0; k < nk; k++) {
+      const d = Math.min(Math.abs(k - kb), nk - Math.abs(k - kb));
+      if (d > 2 && votes[k] >= 0.5 * votes[kb] && (kb2 < 0 || votes[k] > votes[kb2])) kb2 = k;
+    }
+    this.allQ.set(this.mq.subarray(0, nm));
+    this.allT.set(this.mt.subarray(0, nm));
+    this.allQuality.set(this.mquality.subarray(0, nm));
+    for (const k of kb2 >= 0 ? [kb, kb2] : [kb]) {
+      if (votes[k] < MIN_INLIERS) continue;
+      let n = 0;
+      for (let m = 0; m < nm; m++) {
+        const t = this.allT[m];
+        if (!inRange(k, range[2 * t], range[2 * t + 1], nk)) continue;
+        this.mq[n] = this.allQ[m]; this.mt[n] = t; this.mquality[n] = this.allQuality[m];
+        n++;
+      }
+      const r = this.fromMatches(ti, T, n, o, k);
+      if (!r) continue;
+      r.time = { keyframe: k, ranges: this.timeRanges(T, r.tid!, k) };
+      return r;
+    }
+    return null;
+  }
+
+  /** Whether two features of video target T share a keyframe (cached per target). */
+  private covisibility(T: TargetData): (a: number, b: number) => boolean {
+    let fn = this.covisibleFns.get(T);
+    if (!fn) {
+      const range = T.video!.featureRange, nk = T.meta.video!.keyframes.length;
+      fn = (a, b) => rangesOverlap(range[2 * a], range[2 * a + 1], range[2 * b], range[2 * b + 1], nk);
+      this.covisibleFns.set(T, fn);
+    }
+    return fn;
+  }
+
+  /** Video time where most inlier features are on screen, around keyframe k. */
+  private timeRanges(T: TargetData, tid: Int32Array, k: number): number[] {
+    const meta = T.meta.video!, nk = meta.keyframes.length, range = T.video!.featureRange;
+    const cnt = new Int32Array(nk + 1);
+    for (let i = 0; i < tid.length; i++) addRange(cnt, nk, range[2 * tid[i]], range[2 * tid[i] + 1], 1);
+    for (let j = 1; j < nk; j++) cnt[j] += cnt[j - 1];
+    const thr = 0.6 * cnt[k];
+    const out: number[] = [];
+    if (Array.from(cnt.subarray(0, nk)).every((c) => c >= thr)) return [0, meta.duration];
+    // Maximal circular runs above the threshold.
+    let s0 = 0;
+    while (cnt[s0] >= thr) s0++; // a keyframe below the threshold exists
+    for (let j = 1; j <= nk; j++) {
+      const a = (s0 + j) % nk;
+      if (cnt[a] < thr) continue;
+      const prev = (a + nk - 1) % nk;
+      if (cnt[prev] >= thr) continue;
+      let e = a;
+      while (cnt[(e + 1) % nk] >= thr) e++;
+      // Content that slides along can match a neighbouring keyframe about as
+      // well (shifted, it looks like the screen moved): allow the
+      // neighbouring keyframes too, short of cuts.
+      const [f0, f1] = keyframeSpan(meta, isCut(meta, a) ? a : a - 1, isCut(meta, e + 1) ? e : e + 1);
+      out.push(f0 / meta.fps, (f1 + 1) / meta.fps);
+    }
+    return out;
+  }
+
+  private fromMatches(ti: number, T: TargetData, nm: number, o: AcquireOptions, keyframe: number): AcquireResult | null {
+    const { mq, mt, mquality } = this;
+    const fkp = this.features.kp;
     if (nm < MIN_INLIERS) return null;
     // 2. Hough vote on (centre x, centre y, angle, log-scale).
     const sel = this.hough(T, nm);
@@ -129,10 +236,12 @@ export class Acquirer {
     const inl = prosacHomography(src, dst, sel.length, H, mask, this.rng, { maxIter: 300, threshold: 5, confidence: 0.995 });
     if (inl < 6) return null;
     // 4. Guided matching with the homography.
-    const g = this.guided(T, H);
+    const g = this.guided(T, H, keyframe);
     if (!g || g.count < MIN_INLIERS) return null;
     // 5. Pose: IPPE then robust Gauss-Newton.
-    return this.solvePose(ti, T, g.H, g.frame, g.tgt, g.count, o.up ?? null);
+    const r = this.solvePose(ti, T, g.H, g.frame, g.tgt, g.count, o.up ?? null);
+    if (r) r.tid = g.tid;
+    return r;
   }
 
   private hough(T: TargetData, nm: number): number[] {
@@ -175,7 +284,8 @@ export class Acquirer {
   }
 
   /** Re-match all target features near their projections; returns refined H and inliers. */
-  private guided(T: TargetData, H0: Float64Array) {
+  private guided(T: TargetData, H0: Float64Array, keyframe: number) {
+    const range = T.video?.featureRange, nk = T.meta.video?.keyframes.length ?? 0;
     const f = this.features, fkp = f.kp, fdesc = f.desc;
     const nT = T.kp.length / 4;
     const cell = 16;
@@ -190,6 +300,7 @@ export class Acquirer {
     const H = H0;
     const radius = 8;
     for (let i = 0; i < nT; i++) {
+      if (range && !inRange(keyframe, range[2 * i], range[2 * i + 1], nk)) continue;
       const u = T.kp[4 * i], v = T.kp[4 * i + 1];
       if (!applyH(H, u, v, p)) continue;
       const x = p[0], y = p[1];
@@ -233,15 +344,16 @@ export class Acquirer {
     const inl = prosacHomography(src, dst, n, H1, mask, this.rng, { maxIter: 100, threshold: 3, confidence: 0.995 });
     if (inl < MIN_INLIERS) return null;
     homographyDLT(src, dst, n, H1, mask);
-    const frame = new Float32Array(2 * inl), tgt = new Float32Array(2 * inl);
+    const frame = new Float32Array(2 * inl), tgt = new Float32Array(2 * inl), tid = new Int32Array(inl);
     let k = 0;
     for (let i = 0; i < n && k < inl; i++) {
       if (!mask[i]) continue;
       frame[2 * k] = dst[2 * i]; frame[2 * k + 1] = dst[2 * i + 1];
       tgt[2 * k] = src[2 * i]; tgt[2 * k + 1] = src[2 * i + 1];
+      tid[k] = bestT[pairs[i]];
       k++;
     }
-    return { H: H1, frame, tgt, count: k };
+    return { H: H1, frame, tgt, tid, count: k };
   }
 
   private solvePose(ti: number, T: TargetData, H: Float64Array, frame: Float32Array, tgt: Float32Array, n: number, up: ArrayLike<number> | null): AcquireResult | null {
@@ -284,6 +396,30 @@ export function chooseSolution(sols: IppeSolution[], up: ArrayLike<number> | nul
     return Math.min(c, Math.sqrt(Math.max(0, 1 - c * c)));
   };
   return tilt(b) < tilt(a) ? b : a;
+}
+
+/** Keyframe k (any integer, wrapped) starts a new shot. */
+function isCut(meta: { keyframes: number[]; changes: number[] }, k: number): boolean {
+  const nk = meta.keyframes.length, f = meta.keyframes[((k % nk) + nk) % nk];
+  return f === 0 || meta.changes.includes(f);
+}
+
+/** Add v over keyframes [a, b] (b unwrapped past nk for ranges through the loop seam) to a difference array. */
+function addRange(d: Int32Array, nk: number, a: number, b: number, v: number): void {
+  if (b - a + 1 >= nk) { d[0] += v; d[nk] -= v; return; }
+  if (b < nk) { d[a] += v; d[b + 1] -= v; return; }
+  d[a] += v; d[nk] -= v;
+  d[0] += v; d[b - nk + 1] -= v;
+}
+
+function inRange(k: number, a: number, b: number, nk: number): boolean {
+  return (k >= a && k <= b) || (k + nk >= a && k + nk <= b);
+}
+
+/** Keyframe ranges [a0, a1] and [b0, b1] (ends unwrapped past nk through the loop seam) share a keyframe. */
+function rangesOverlap(a0: number, a1: number, b0: number, b1: number, nk: number): boolean {
+  if (a1 - a0 + 1 >= nk || b1 - b0 + 1 >= nk) return true;
+  return (a0 <= b1 && b0 <= a1) || (a0 + nk <= b1 && b0 <= a1 + nk) || (a0 <= b1 + nk && b0 + nk <= a1);
 }
 
 function cellOf(kp: Float32Array, q: number, cell: number, gw: number, gh: number): number {

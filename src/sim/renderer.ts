@@ -15,6 +15,8 @@ export interface TexturedPlane {
   /** Plane frame: x right, y down, z into the plane; origin at texture centre. */
   pose: (t: number) => RigidPose;
   texture: GrayImage;
+  /** Time-varying texture (a playing video); same size as `texture`. */
+  textureAt?: (t: number) => GrayImage;
   metersPerTexel: number;
   tile?: boolean;
   /** If set, the plane is only rendered when this returns true. */
@@ -94,7 +96,7 @@ export class Renderer {
     const dy = (y - K.cy) / K.fy;
     const nPlanes = this.planes.length;
     // Per-plane camera-in-plane transforms for this row.
-    const tf: Array<{ R: Float64Array; o: Float64Array; pl: PreparedPlane } | null> = [];
+    const tf: Array<{ R: Float64Array; o: Float64Array; pl: PreparedPlane; mips: GrayImage[] } | null> = [];
     for (let k = 0; k < nPlanes; k++) {
       const pl = this.planes[k];
       if (pl.active && !pl.active(t)) { tf.push(null); continue; }
@@ -106,7 +108,7 @@ export class Renderer {
         pp.R[1] * ex + pp.R[4] * ey + pp.R[7] * ez,
         pp.R[2] * ex + pp.R[5] * ey + pp.R[8] * ez,
       );
-      tf.push({ R, o, pl });
+      tf.push({ R, o, pl, mips: pl.textureAt ? mipsOf(pl.textureAt(t)) : pl.mips });
     }
     const row = y * W;
     for (let x = 0; x < W; x++) {
@@ -133,11 +135,18 @@ export class Renderer {
         const cosv = Math.abs(pz) / Math.sqrt(px * px + py * py + pz * pz);
         const foot = lam / K.fx / Math.max(cosv, 0.15) / mpt;
         const lev = foot > 1 ? Math.log2(foot) : 0;
-        val = sampleTrilinear(pl.mips, lev, u, v, !!pl.tile);
+        val = sampleTrilinear(f.mips, lev, u, v, !!pl.tile);
       }
       acc[row + x] += val;
     }
   }
+}
+
+const mipCache = new WeakMap<GrayImage, GrayImage[]>();
+function mipsOf(tex: GrayImage): GrayImage[] {
+  let m = mipCache.get(tex);
+  if (!m) mipCache.set(tex, (m = buildMips(tex)));
+  return m;
 }
 
 function buildMips(tex: GrayImage): GrayImage[] {

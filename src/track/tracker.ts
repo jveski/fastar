@@ -1,10 +1,12 @@
 import type { Pyramid } from '../image/pyramid';
 import { createGray, type GrayImage } from '../image/gray';
-import type { TargetData } from '../target/format';
+import { VPT_STATIONARY, type TargetData } from '../target/format';
+import { VideoModel } from '../target/video';
 import type { Intrinsics } from '../vision/camera';
 import { Klt } from '../vision/klt';
 import { NccMatcher } from '../vision/ncc';
-import { PoseSolver, poseToHomography } from '../vision/pose';
+import { DEFAULT_POSE_OPTIONS, PoseSolver, poseToHomography } from '../vision/pose';
+import { ippe } from '../vision/ippe';
 import { mat3Invert } from '../math/rot';
 
 export interface TrackerOptions {
@@ -40,6 +42,55 @@ export const DEFAULT_TRACKER: TrackerOptions = {
   margin: 12,
   fbThreshold: 1.5,
 };
+
+/** Video time for a frame, in video frame coordinates (video time * fps). */
+export interface VideoWindow {
+  /** Best estimate. */
+  x: number;
+  /** Credible interval: points must stay on screen (and still, unless locked) across it. */
+  lo: number;
+  hi: number;
+  /** The estimate is good to a fraction of a frame: moving points are usable. */
+  locked: boolean;
+}
+
+/** Whether coarse re-alignment also tries the other planar tilt (see coarseAlign). */
+export const Flips = { None: 0, Free: 1, Careful: 2 } as const;
+export type Flips = (typeof Flips)[keyof typeof Flips];
+
+/** Coarse re-alignment: pyramid level, search radius there (px), NCC threshold, points tried. */
+const COARSE_LEVEL = 2;
+const COARSE_SEARCH = 10;
+const COARSE_NCC = 0.7;
+const COARSE_ATTEMPTS = 120;
+/** Points tried per candidate time when searching the time and pose together. */
+const SEARCH_ATTEMPTS = 60;
+/** Points checked at full resolution to choose between candidate poses. */
+const FINE_SAMPLE = 32;
+/** Most rounds of that search (each from the best pose of the last). */
+const SEARCH_ROUNDS = 3;
+/**
+ * Time evidence from the tracked points: log-likelihood per px^2 of
+ * (capped) squared residual, the cap (px), and the most one frame's
+ * evidence may move from the mean (the points' errors are not independent).
+ */
+const GEO_GAIN = 0.5;
+const GEO_RES_CAP = 3;
+const GEO_CAP = 6;
+/** Frames of starved replenishment before looking for a better pose. */
+const DOUBT_FRAMES = 4;
+
+/**
+ * Log-likelihood of a probe's NCC: above PROBE_MID favours the predicted
+ * content being on screen, below it the opposite; capped so one occluded or
+ * blurred probe cannot outvote the rest.
+ */
+const PROBE_MID = 0.6;
+const PROBE_GAIN = 3;
+function probeLlr(ncc: number): number {
+  const v = PROBE_GAIN * (ncc - PROBE_MID);
+  return v > 1.2 ? 1.2 : v < -1.2 ? -1.2 : v;
+}
 
 export interface TrackTimings {
   klt: number;
@@ -98,19 +149,72 @@ export class TargetTracker {
   private nccCursor = 0;
   private replCursor = 0;
 
+  /** Video targets: baked points over time, and which points are usable at the current time. */
+  readonly video: VideoModel | null;
+  readonly usable: Uint8Array;
+  /** Video frame coordinate the point positions are set for. */
+  frameX = 0;
+  private readonly metresPerPx: number;
+  private readonly Hc = new Float64Array(9);
+  private readonly pb = new Float64Array(2);
+  private readonly probeNcc = new NccMatcher(4, 1);
+  private probeCursor = 0;
+  private probeFrame: GrayImage | null = null;
+  private readonly probeSpans = new Int32Array(64);
+  private probeMark = new Uint8Array(0);
+  private probeVals = new Float64Array(256);
+  private probeSel = new Int32Array(24);
+  /** Per-candidate poses while probing the time. */
+  private readonly timeSolver: PoseSolver;
+  private readonly Rp = new Float64Array(9);
+  private readonly tp = new Float64Array(3);
+  private tImg = new Float32Array(0);
+  private geoCost = new Float64Array(0);
+  /** Cost of the last poseForTime fit (NaN if it kept the current pose). */
+  private fitCost = NaN;
+  /** Wide, coarse re-alignment (video). */
+  private readonly coarseNcc = new NccMatcher(4, COARSE_SEARCH);
+  private readonly cObj: Float32Array;
+  private readonly cImg: Float32Array;
+  private coarseCursor = 0;
+  private readonly cNorm: Float64Array;
+  private readonly Rbest = new Float64Array(9);
+  private readonly Rs0 = new Float64Array(9);
+  private readonly ts0 = new Float64Array(3);
+  private readonly tbest = new Float64Array(3);
+  private readonly Rq = new Float64Array(9);
+  private readonly tq = new Float64Array(3);
+  private doubt = 0;
+  /** Video: replenishing has kept failing; the time and pose are suspect (see checkAlignment). */
+  starved = false;
+  private replTried = 0;
+  private replFound = 0;
+
   constructor(readonly target: TargetData, public K: Intrinsics, opts: Partial<TrackerOptions> = {}) {
     this.o = { ...DEFAULT_TRACKER, ...opts };
     const m = target.meta;
-    const s = m.physicalWidth / m.width;
+    const s = (this.metresPerPx = m.physicalWidth / m.width);
     const cu = (m.width - 1) / 2, cv = (m.height - 1) / 2;
-    this.numTrackPoints = target.trackPoints.length / 2;
-    this.obj = new Float32Array(2 * this.numTrackPoints);
-    for (let i = 0; i < this.numTrackPoints; i++) {
-      this.obj[2 * i] = (target.trackPoints[2 * i] - cu) * s;
-      this.obj[2 * i + 1] = (target.trackPoints[2 * i + 1] - cv) * s;
+    if (target.video) {
+      const V = (this.video = new VideoModel(target));
+      this.numTrackPoints = V.numPoints;
+      this.obj = new Float32Array(2 * this.numTrackPoints);
+      this.usable = new Uint8Array(this.numTrackPoints);
+      this.probeMark = new Uint8Array(this.numTrackPoints);
+      this.images = [];
+      this.imgPixelM = V.patchScales.map((k) => s * k);
+    } else {
+      this.video = null;
+      this.numTrackPoints = target.trackPoints.length / 2;
+      this.obj = new Float32Array(2 * this.numTrackPoints);
+      for (let i = 0; i < this.numTrackPoints; i++) {
+        this.obj[2 * i] = (target.trackPoints[2 * i] - cu) * s;
+        this.obj[2 * i + 1] = (target.trackPoints[2 * i + 1] - cv) * s;
+      }
+      this.usable = new Uint8Array(this.numTrackPoints).fill(1);
+      this.images = m.images.map((im, k) => createGray(im.width, im.height, target.images[k]));
+      this.imgPixelM = m.images.map((im) => m.physicalWidth / im.width);
     }
-    this.images = m.images.map((im, k) => createGray(im.width, im.height, target.images[k]));
-    this.imgPixelM = m.images.map((im) => m.physicalWidth / im.width);
     const cap = Math.max(this.o.maxPoints, this.numTrackPoints);
     this.idx = new Int32Array(cap);
     this.pos = new Float32Array(2 * cap);
@@ -121,12 +225,60 @@ export class TargetTracker {
     this.sObj = new Float32Array(2 * cap);
     this.sImg = new Float32Array(2 * cap);
     this.solver = new PoseSolver(cap);
+    this.timeSolver = new PoseSolver(cap, { ...DEFAULT_POSE_OPTIONS, maxIter: 3 });
+    this.cObj = new Float32Array(2 * Math.max(cap, COARSE_ATTEMPTS));
+    this.cImg = new Float32Array(2 * Math.max(cap, COARSE_ATTEMPTS));
+    this.cNorm = new Float64Array(2 * Math.max(cap, COARSE_ATTEMPTS));
   }
 
   reset(): void {
     this.n = 0;
+    this.doubt = 0;
+    this.starved = false;
     this.active.fill(0);
     this.ok = false;
+  }
+
+  /**
+   * Video targets: set the video time of the next frame. Points must be on
+   * screen across the window; unless the time is locked they must also hold
+   * still across it. Active points that stop being usable are dropped.
+   */
+  setTime(w: VideoWindow): void {
+    const V = this.video;
+    if (!V) return;
+    this.frameX = w.x;
+    const m = this.target.meta, s = this.metresPerPx;
+    const cu = (m.width - 1) / 2, cv = (m.height - 1) / 2;
+    // Locked: on screen at the estimate (near a cut, the wrong side just fails to track for a frame).
+    const a = w.locked ? w.x : w.lo, b = w.locked ? w.x : w.hi;
+    const p = this.pb, usable = this.usable, obj = this.obj;
+    for (let j = 0; j < this.numTrackPoints; j++) {
+      let ok = V.covers(j, a, b);
+      if (ok && !w.locked) ok = V.motion(j, a, b, w.x) <= 0.5;
+      usable[j] = ok ? 1 : 0;
+      if (!ok) continue;
+      V.positionAt(j, w.x, p);
+      obj[2 * j] = (p[0] - cu) * s;
+      obj[2 * j + 1] = (p[1] - cv) * s;
+    }
+    let k = 0;
+    for (let i = 0; i < this.n; i++) {
+      const j = this.idx[i];
+      if (!usable[j]) { this.active[j] = 0; continue; }
+      this.idx[k] = j;
+      this.pos[2 * k] = this.pos[2 * i];
+      this.pos[2 * k + 1] = this.pos[2 * i + 1];
+      k++;
+    }
+    this.n = k;
+  }
+
+  /** Points usable at the current video time (all, for image targets). */
+  usableCount(): number {
+    let c = 0;
+    for (let j = 0; j < this.numTrackPoints; j++) c += this.usable[j];
+    return c;
   }
 
   /**
@@ -138,6 +290,9 @@ export class TargetTracker {
     for (let i = 0; i < 9; i++) this.R[i] = R[i];
     for (let i = 0; i < 3; i++) this.t[i] = t[i];
     this.replCursor = 0;
+    // Video: the pose may be well off (an acquisition matched against a
+    // keyframe whose content has moved on since); line it up coarsely first.
+    if (this.video) this.coarseAlign(frame, this.R, this.t);
     this.replenish(frame.levels[0], maxAttempts, this.o.maxPoints);
     if (this.n < minPoints) { this.reset(); return false; }
     this.ok = this.solve(this.R, this.t);
@@ -198,11 +353,194 @@ export class TargetTracker {
     t0 = now();
     tm.solve += t0 - t1;
     // 4. Replenish lost points from the target's tracking points.
+    this.replTried = this.replFound = 0;
     if (this.n < o.maxPoints) this.replenish(cur.levels[0], o.replenishAttempts, o.maxPoints);
+    if (this.video) this.checkAlignment();
     tm.replenish = now() - t0;
     if (this.inliers < o.minInliers) return this.fail();
     this.ok = true;
     return true;
+  }
+
+  /**
+   * Video targets: a pose can hold itself up on a few points when much of
+   * the picture moves as one (a layer sliding across looks like the screen
+   * moving, so a wrong time and a matching wrong pose fit together): the
+   * points fit, but hardly any other point is where this pose says. When
+   * replenishing keeps failing like that, `starved` is raised for the
+   * caller to search the time and pose again (see searchTime).
+   */
+  private checkAlignment(): void {
+    const o = this.o;
+    const starved = this.n < 0.5 * o.maxPoints && this.replTried >= 10 && this.replFound < 0.25 * this.replTried;
+    this.doubt = starved ? this.doubt + 1 : 0;
+    this.starved = this.doubt >= DOUBT_FRAMES;
+    if (this.starved) this.doubt = 0;
+  }
+
+  /**
+   * Video targets: for each candidate frame coordinate, the pose found by
+   * coarseAlign from (R, t) and how many points agree with it (into
+   * `inliers`; `flips` as for coarseAlign). Returns the index of the candidate most points agree with
+   * (its pose in Rbest, tbest), or -1. Changes nothing else.
+   */
+  searchTime(frame: Pyramid, R: ArrayLike<number>, t: ArrayLike<number>, frames: ArrayLike<number>, count: number,
+    inliers: Float64Array, Rbest: Float64Array, tbest: Float64Array, flips: Flips = Flips.None, attempts = SEARCH_ATTEMPTS): number {
+    let best = -1;
+    const Rc = this.Rq, tc = this.tq, R0 = this.Rs0, t0 = this.ts0;
+    for (let i = 0; i < 9; i++) R0[i] = R[i];
+    for (let i = 0; i < 3; i++) t0[i] = t[i];
+    // Again from the best pose found, while that helps: a start far off
+    // (tens of pixels) finds few points at any time, the right one included.
+    for (let round = 0; round < SEARCH_ROUNDS; round++) {
+      const prev = best < 0 ? 0 : inliers[best];
+      let bi = -1;
+      for (let ci = 0; ci < count; ci++) {
+        Rc.set(R0);
+        tc.set(t0);
+        const inl = (inliers[ci] = this.coarseAlign(frame, Rc, tc, attempts, frames[ci] + 0.5, flips));
+        if (inl > 0 && (bi < 0 || inl > inliers[bi])) {
+          bi = ci;
+          Rbest.set(Rc);
+          tbest.set(tc);
+        }
+      }
+      if (bi < 0) { best = -1; break; }
+      best = bi;
+      if (inliers[bi] < 1.2 * prev + 2 || inliers[bi] >= 0.8 * attempts) break;
+      R0.set(Rbest);
+      t0.set(tbest);
+    }
+    return best;
+  }
+
+  /**
+   * Video targets: refine (R, t) in place from points matched at a coarse
+   * pyramid level over a wide window (tens of pixels at full resolution),
+   * with a robust solve. Points are placed for the current video time, or
+   * for frame coordinate x if given. With `flips`, also tries both planar
+   * solutions of the matches, for a start that may have tilted the wrong
+   * way (a target seen nearly head-on can tilt either way): Free picks
+   * whichever fits best at full resolution (after an acquisition), Careful
+   * keeps the start unless another fits clearly better (while tracking).
+   * Returns the number of agreeing points, or 0 (pose unchanged) if too few
+   * agree.
+   */
+  coarseAlign(frame: Pyramid, R: Float64Array, t: Float64Array, attempts = COARSE_ATTEMPTS, x = NaN, flips: Flips = Flips.None): number {
+    const V = this.video;
+    if (!V || this.numTrackPoints === 0) return 0;
+    const L = Math.min(COARSE_LEVEL, frame.levels.length - 1);
+    if (L < 1) return 0;
+    const img = frame.levels[L], sc = 1 << L, K = this.K, o = this.o;
+    // Patch level closest to the pixels of this pyramid level.
+    const pxPerM = K.fx / Math.max(1e-3, t[2]) / sc;
+    let k = 0, bestErr = Infinity;
+    for (let i = 0; i < this.imgPixelM.length; i++) {
+      const e = Math.abs(Math.log(this.imgPixelM[i] * pxPerM));
+      if (e < bestErr) { bestErr = e; k = i; }
+    }
+    if (!this.setupWarp(k, R, t)) return 0;
+    // Frame pixels of level L -> base pixels.
+    const Hi = this.Hinv;
+    Hi[0] *= sc; Hi[1] *= sc; Hi[3] *= sc; Hi[4] *= sc; Hi[6] *= sc; Hi[7] *= sc;
+    const ncc = this.coarseNcc, obj = this.cObj, im = this.cImg, p = this.p2;
+    const edge = ncc.half + ncc.search + 1;
+    const total = this.numTrackPoints;
+    let n = 0, tried = 0;
+    const at = x === x, m = this.target.meta, s = this.metresPerPx, pb = this.pb;
+    const cu = (m.width - 1) / 2, cv = (m.height - 1) / 2;
+    for (let c = 0; c < total && tried < attempts; c++) {
+      const j = (this.coarseCursor + c) % total;
+      let X: number, Y: number;
+      if (at) {
+        if (!V.validAt(j, x)) continue;
+        V.positionAt(j, x, pb);
+        X = (pb[0] - cu) * s; Y = (pb[1] - cv) * s;
+      } else {
+        if (!this.usable[j]) continue;
+        X = this.obj[2 * j]; Y = this.obj[2 * j + 1];
+      }
+      if (!project(K, R, t, X, Y, p, 0)) continue;
+      const u = p[0] / sc, v = p[1] / sc;
+      if (u < edge || v < edge || u >= img.width - edge || v >= img.height - edge) continue;
+      tried++;
+      if (!this.buildTemplate(ncc, j, k, u, v, at ? x : this.frameX) || !ncc.match(img, COARSE_NCC)) continue;
+      obj[2 * n] = X;
+      obj[2 * n + 1] = Y;
+      im[2 * n] = ncc.x * sc;
+      im[2 * n + 1] = ncc.y * sc;
+      n++;
+    }
+    const need = o.minInliers + 4;
+    if (n < need) return 0;
+    let best = 0;
+    const Rs = this.Rp, ts = this.tp, nim = this.cNorm;
+    for (let i = 0; i < n; i++) {
+      nim[2 * i] = (im[2 * i] - K.cx) / K.fx;
+      nim[2 * i + 1] = (im[2 * i + 1] - K.cy) / K.fy;
+    }
+    // Coarse matches cannot tell the two tilts apart; full-resolution ones can.
+    const sols = flips !== Flips.None ? ippe(obj, nim, n) : [];
+    let bestFine = -1;
+    for (let c = -1; c < sols.length; c++) {
+      Rs.set(c < 0 ? R : sols[c].R);
+      ts.set(c < 0 ? t : sols[c].t);
+      // Twice: the start may be far off.
+      if (!this.timeSolver.solve(K, obj, im, n, Rs, ts) || !(ts[2] > 0)) continue;
+      if (!this.timeSolver.solve(K, obj, im, n, Rs, ts) || !(ts[2] > 0)) continue;
+      const inl = this.timeSolver.inliers;
+      if (inl < need || inl < 0.4 * n) continue;
+      const fine = sols.length ? this.fineScore(frame.levels[0], Rs, ts, x) : 0;
+      // The check samples few points: a careful switch needs a clear margin.
+      const margin = flips === Flips.Careful && best > 0 ? Math.max(3, 0.25 * bestFine) : 0;
+      if (best === 0 || fine > bestFine + margin || (margin === 0 && fine === bestFine && inl > best)) {
+        bestFine = fine;
+        best = inl;
+        this.Rbest.set(Rs);
+        this.tbest.set(ts);
+      }
+    }
+    this.coarseCursor = (this.coarseCursor + 7919) % Math.max(1, total);
+    if (best === 0) return 0;
+    R.set(this.Rbest);
+    t.set(this.tbest);
+    return best;
+  }
+
+  /**
+   * How many of a fixed sample of points match at full resolution (NCC
+   * within a few pixels) at pose (R, t), placed for frame coordinate x (or
+   * the current time). Same sample every call, so poses compare fairly.
+   */
+  private fineScore(frame: GrayImage, R: Float64Array, t: Float64Array, x: number): number {
+    const V = this.video!, K = this.K, o = this.o, m = this.target.meta, s = this.metresPerPx;
+    const cu = (m.width - 1) / 2, cv = (m.height - 1) / 2;
+    const pxPerM = K.fx / Math.max(1e-3, t[2]);
+    let k = 0, bestErr = Infinity;
+    for (let i = 0; i < this.imgPixelM.length; i++) {
+      const e = Math.abs(Math.log(this.imgPixelM[i] * pxPerM));
+      if (e < bestErr) { bestErr = e; k = i; }
+    }
+    if (!this.setupWarp(k, R, t)) return 0;
+    const at = x === x, total = this.numTrackPoints, p = this.p2, pb = this.pb;
+    let tried = 0, found = 0;
+    for (let c = 0; c < total && tried < FINE_SAMPLE; c++) {
+      const j = (this.coarseCursor + c * 7) % total;
+      let X: number, Y: number;
+      if (at) {
+        if (!V.validAt(j, x)) continue;
+        V.positionAt(j, x, pb);
+        X = (pb[0] - cu) * s; Y = (pb[1] - cv) * s;
+      } else {
+        if (!this.usable[j]) continue;
+        X = this.obj[2 * j]; Y = this.obj[2 * j + 1];
+      }
+      if (!project(K, R, t, X, Y, p, 0)) continue;
+      if (p[0] < o.margin || p[1] < o.margin || p[0] >= K.width - o.margin || p[1] >= K.height - o.margin) continue;
+      tried++;
+      if (this.buildTemplate(this.ncc, j, k, p[0], p[1], at ? x : this.frameX) && this.ncc.match(frame, o.minNcc)) found++;
+    }
+    return found;
   }
 
   private fail(): boolean {
@@ -274,18 +612,239 @@ export class TargetTracker {
   private pickImage(): number {
     const pxPerM = this.K.fx / Math.max(1e-3, this.t[2]);
     let best = 0, bestErr = Infinity;
-    for (let k = 0; k < this.images.length; k++) {
+    for (let k = 0; k < this.imgPixelM.length; k++) {
       const e = Math.abs(Math.log(this.imgPixelM[k] * pxPerM));
       if (e < bestErr) { bestErr = e; best = k; }
     }
     return best;
   }
 
-  /** Set up H (target image k px -> frame px) and its inverse for the current pose. */
-  private setupWarp(k: number): boolean {
-    const im = this.images[k];
-    poseToHomography(this.K, this.R, this.t, this.imgPixelM[k], (im.width - 1) / 2, (im.height - 1) / 2, this.H);
+  /**
+   * Set up H (target image k px -> frame px) and its inverse for the current
+   * pose. Video targets: base px -> frame px (patches are placed per point).
+   */
+  private setupWarp(k: number, R: ArrayLike<number> = this.R, t: ArrayLike<number> = this.t): boolean {
+    if (this.video) {
+      const m = this.target.meta;
+      poseToHomography(this.K, R, t, this.metresPerPx, (m.width - 1) / 2, (m.height - 1) / 2, this.H);
+    } else {
+      const im = this.images[k];
+      poseToHomography(this.K, R, t, this.imgPixelM[k], (im.width - 1) / 2, (im.height - 1) / 2, this.H);
+    }
     return mat3Invert(this.H, this.Hinv);
+  }
+
+  /** NCC template for point j predicted at frame (x, y), from image k or (video) the point's patch at level k. */
+  private buildTemplate(ncc: NccMatcher, j: number, k: number, x: number, y: number, frameX = this.frameX): boolean {
+    const V = this.video;
+    if (!V) return ncc.buildTemplate(this.images[k], this.Hinv, x, y);
+    // Patch pixel = (base px - point position) / scale + centre.
+    const sc = V.patchScales[k], a = 1 / sc, c = (V.patchSize - 1) / 2;
+    V.positionAt(j, frameX, this.pb);
+    const bx = c - this.pb[0] * a, by = c - this.pb[1] * a;
+    const Hi = this.Hinv, Hc = this.Hc;
+    Hc[0] = a * Hi[0] + bx * Hi[6]; Hc[1] = a * Hi[1] + bx * Hi[7]; Hc[2] = a * Hi[2] + bx * Hi[8];
+    Hc[3] = a * Hi[3] + by * Hi[6]; Hc[4] = a * Hi[4] + by * Hi[7]; Hc[5] = a * Hi[5] + by * Hi[8];
+    Hc[6] = Hi[6]; Hc[7] = Hi[7]; Hc[8] = Hi[8];
+    return ncc.buildTemplate(V.patch(V.snapshotAt(j, frameX), k), Hc, x, y);
+  }
+
+  /**
+   * Video targets: evidence about the video time from the current frame at
+   * the current pose, as a log-likelihood per video frame added into `llr`
+   * (length frameCount, zeroed here). Each probe point says where it should
+   * be, and how it should look, at each frame:
+   *   - a point that holds still with one appearance through its time on
+   *     screen is checked once: its content is visible or not, which favours
+   *     or disfavours the frames it is on screen for;
+   *   - a moving or changing point is checked at the candidate frames
+   *     (unwrapped indices) where it is on screen, relative to its mean.
+   * Frames a probe says nothing about stay at 0: the same content often
+   * shows at other times too (a point lost by the compiler and picked up
+   * again is another point), so absence is not evidence.
+   * Mostly points that move, change or appear within the candidates are
+   * used; a few still points with a limited time on screen keep the
+   * hypothesis on the right shot. Returns the number of probes used.
+   */
+  probeTime(frame: GrayImage, frames: ArrayLike<number>, count: number, llr: Float64Array, maxProbes = 24): number {
+    const V = this.video;
+    if (!V) return 0;
+    const N = V.frameCount;
+    llr.fill(0, 0, N);
+    this.probeFrame = frame;
+    if (count < 1) return 0;
+    const k = this.pickImage();
+    if (!this.setupWarp(k)) return 0;
+    const a = frames[0], b = frames[count - 1] + 1, mid = 0.5 * (a + b);
+    const total = this.numTrackPoints;
+    const ncc = this.probeNcc;
+    // First pass: points that keep moving through the candidates (they say
+    // which frame is on screen). Second: still points (a few per span, a
+    // third of the budget at most: they all say the same thing about their
+    // span), and points that move or change only somewhere in the window.
+    const maxStill = Math.max(2, Math.floor(maxProbes / 3));
+    const spans = this.probeSpans;
+    let nSpans = 0;
+    let used = 0, still = 0, c = 0;
+    const mark = this.probeMark;
+    mark.fill(0, 0, total);
+    if (this.probeSel.length < maxProbes) this.probeSel = new Int32Array(maxProbes);
+    const sel = this.probeSel;
+    let ns = 0;
+    for (let pass = 0; pass < 2 && used + ns < maxProbes; pass++) {
+      for (c = 0; c < total && used + ns < maxProbes; c++) {
+        const j = (this.probeCursor + c) % total;
+        if (mark[j]) continue;
+        const stationary = (V.flags[j] & VPT_STATIONARY) !== 0 && V.snapshotCount(j) === 1;
+        if (stationary && V.always(j)) continue;
+        if (pass === 0) {
+          if (stationary || V.movingFraction(j, a, b) < 0.5) continue;
+        } else if (stationary) {
+          if (still >= maxStill) continue;
+          let same = 0;
+          for (let q = 0; q < nSpans; q++) if (spans[2 * q] === V.start[j] && spans[2 * q + 1] === V.end[j]) same++;
+          if (same >= 2) continue;
+          const sc = this.probeAt(ncc, j, k, V.start[j] + 0.5);
+          if (Number.isNaN(sc)) continue;
+          this.addSpan(llr, j, probeLlr(sc), 0);
+          if (nSpans < spans.length / 2) { spans[2 * nSpans] = V.start[j]; spans[2 * nSpans + 1] = V.end[j]; nSpans++; }
+          used++;
+          still++;
+          continue;
+        } else if (V.covers(j, a, b - 1e-6) && V.motion(j, a, b, mid) <= 1 && !V.changesWithin(j, a, b)) {
+          continue;
+        }
+        let valid = 0;
+        for (let ci = 0; ci < count && valid < 2; ci++) if (V.validAt(j, frames[ci] + 0.5)) valid++;
+        if (valid < 2) continue;
+        mark[j] = 1;
+        sel[ns++] = j;
+      }
+    }
+    this.probeCursor = (this.probeCursor + Math.max(1, c)) % Math.max(1, total);
+    if (ns === 0) return used;
+    // Each candidate frame is checked at the pose the tracked points give for
+    // it. Content moving as one (a pan, a zoom, a layer sliding across) looks
+    // just like the screen moving: at the pose fitted for one time, the
+    // content of a nearby time can line up too, and the time would hold
+    // itself up. Re-fitted per candidate, only the right time lines up
+    // everything.
+    if (this.probeVals.length < ns * count) this.probeVals = new Float64Array(ns * count);
+    const vals = this.probeVals;
+    vals.fill(NaN, 0, ns * count);
+    this.prepareTimePoses();
+    if (this.geoCost.length < count) this.geoCost = new Float64Array(count);
+    const geo = this.geoCost;
+    for (let ci = 0; ci < count; ci++) {
+      const x = frames[ci] + 0.5;
+      const Rp = this.poseForTime(x);
+      geo[ci] = this.fitCost;
+      if (!this.setupWarp(k, Rp, this.tp)) continue;
+      for (let q = 0; q < ns; q++) {
+        const j = sel[q];
+        if (!V.validAt(j, x)) continue;
+        const sc = this.probeAt(ncc, j, k, x, Rp, this.tp);
+        if (!Number.isNaN(sc)) vals[q * count + ci] = probeLlr(sc);
+      }
+    }
+    for (let q = 0; q < ns; q++) {
+      // Centred on the probe's own mean: content that matches about as
+      // well everywhere (repeating glyphs, flat areas) says nothing; only
+      // the frames it matches better than its other candidates gain.
+      let ne = 0, mean = 0;
+      for (let ci = 0; ci < count; ci++) {
+        const v = vals[q * count + ci];
+        if (v === v) { mean += v; ne++; }
+      }
+      if (ne < 2) continue;
+      mean /= ne;
+      for (let ci = 0; ci < count; ci++) {
+        const v = vals[q * count + ci];
+        if (v === v) llr[((frames[ci] % N) + N) % N] += v - mean;
+      }
+      used++;
+    }
+    // The tracked points themselves: how well the best pose for each time
+    // fits them. Their sub-pixel positions tell apart times whose content
+    // differs by less than the probes resolve, and a time error that a
+    // slightly wrong pose would otherwise absorb.
+    let ng = 0, gm = 0;
+    for (let ci = 0; ci < count; ci++) if (geo[ci] === geo[ci]) { gm += geo[ci]; ng++; }
+    if (ng >= 2) {
+      gm /= ng;
+      for (let ci = 0; ci < count; ci++) {
+        if (geo[ci] !== geo[ci]) continue;
+        const v = GEO_GAIN * (gm - geo[ci]);
+        llr[((frames[ci] % N) + N) % N] += v > GEO_CAP ? GEO_CAP : v < -GEO_CAP ? -GEO_CAP : v;
+      }
+      used++;
+    }
+    return used;
+  }
+
+  /** Rolling-shutter-corrected positions of the active points, for poseForTime. */
+  private prepareTimePoses(): void {
+    if (this.tImg.length < 2 * this.n) this.tImg = new Float32Array(2 * this.n);
+    this.deskew(this.pos, this.tImg, this.n, this.rsX, this.rsY);
+  }
+
+  /**
+   * The pose (returned R, and this.tp) that fits the active points' tracked
+   * positions to where the video puts them at frame coordinate x; the
+   * current pose if too few of them are on screen then.
+   */
+  private poseForTime(x: number): Float64Array {
+    const V = this.video!, m = this.target.meta, s = this.metresPerPx;
+    const cu = (m.width - 1) / 2, cv = (m.height - 1) / 2;
+    const Rp = this.Rp, tp = this.tp, obj = this.sObj, img = this.sImg, p = this.pb;
+    Rp.set(this.R);
+    tp.set(this.t);
+    let n = 0;
+    for (let i = 0; i < this.n; i++) {
+      const j = this.idx[i];
+      if (!V.validAt(j, x)) continue;
+      V.positionAt(j, x, p);
+      obj[2 * n] = (p[0] - cu) * s;
+      obj[2 * n + 1] = (p[1] - cv) * s;
+      img[2 * n] = this.tImg[2 * i];
+      img[2 * n + 1] = this.tImg[2 * i + 1];
+      n++;
+    }
+    this.fitCost = NaN;
+    if (n < this.o.minInliers + 4) return Rp;
+    if (!this.timeSolver.solve(this.K, obj, img, n, Rp, tp) || !(tp[2] > 0) || this.timeSolver.inliers < this.o.minInliers) {
+      Rp.set(this.R);
+      tp.set(this.t);
+      return Rp;
+    }
+    // Capped squared residuals, scaled to the active points (some may not be
+    // on screen at x).
+    const res = this.timeSolver.residuals;
+    let c = 0;
+    for (let i = 0; i < n; i++) c += Math.min(res[i] * res[i], GEO_RES_CAP * GEO_RES_CAP);
+    this.fitCost = (c / n) * this.n;
+    return Rp;
+  }
+
+  /** Probe NCC of point j as shown at frame coordinate x, or NaN if it cannot be checked here. */
+  private probeAt(ncc: NccMatcher, j: number, k: number, x: number, R: ArrayLike<number> = this.R, t: ArrayLike<number> = this.t): number {
+    const V = this.video!, m = this.target.meta, s = this.metresPerPx, K = this.K, mg = this.o.margin;
+    const p = this.pb, q = this.p2;
+    V.positionAt(j, x, p);
+    if (!project(K, R, t, (p[0] - (m.width - 1) / 2) * s, (p[1] - (m.height - 1) / 2) * s, q, 0)) return NaN;
+    if (q[0] < mg || q[1] < mg || q[0] >= K.width - mg || q[1] >= K.height - mg) return NaN;
+    if (!this.buildTemplate(ncc, j, k, q[0], q[1], x)) return NaN;
+    ncc.match(this.probeFrame!, -2);
+    return ncc.score;
+  }
+
+  /** Add `inside` over the frames point j is on screen and `outside` over the rest. */
+  private addSpan(llr: Float64Array, j: number, inside: number, outside: number): void {
+    const V = this.video!, N = V.frameCount;
+    if (outside !== 0) for (let f = 0; f < N; f++) llr[f] += outside;
+    const d = inside - outside;
+    if (d === 0) return;
+    for (let f = V.start[j]; f <= V.end[j] && f < V.start[j] + N; f++) llr[f % N] += d;
   }
 
   private driftCorrect(frame: GrayImage): number {
@@ -293,7 +852,6 @@ export class TargetTracker {
     if (n === 0) return 0;
     const k = this.pickImage();
     if (!this.setupWarp(k)) return 0;
-    const img = this.images[k];
     const cnt = Math.min(this.o.nccPerFrame, n);
     let corrected = 0;
     const drop = this.status; // reuse as a drop mask
@@ -303,7 +861,7 @@ export class TargetTracker {
       const j = this.idx[i];
       if (!project(this.K, this.R, this.t, this.obj[2 * j], this.obj[2 * j + 1], this.p2, 0)) continue;
       const ncc = this.ncc;
-      if (!ncc.buildTemplate(img, this.Hinv, this.p2[0], this.p2[1])) continue;
+      if (!this.buildTemplate(ncc, j, k, this.p2[0], this.p2[1])) continue;
       if (ncc.match(frame, this.o.minNcc)) {
         this.pos[2 * i] = ncc.x;
         this.pos[2 * i + 1] = ncc.y;
@@ -332,17 +890,18 @@ export class TargetTracker {
     if (total === 0) return;
     const k = this.pickImage();
     if (!this.setupWarp(k)) return;
-    const img = this.images[k];
     const o = this.o, K = this.K;
     let tried = 0, c = 0;
     for (; c < total && tried < attempts && this.n < maxPoints; c++) {
       const j = (this.replCursor + c) % total;
-      if (this.active[j]) continue;
+      if (this.active[j] || !this.usable[j]) continue;
       if (!project(K, this.R, this.t, this.obj[2 * j], this.obj[2 * j + 1], this.p2, 0)) continue;
       const x = this.p2[0], y = this.p2[1];
       if (x < o.margin || y < o.margin || x >= K.width - o.margin || y >= K.height - o.margin) continue;
       tried++;
-      if (!this.ncc.buildTemplate(img, this.Hinv, x, y) || !this.ncc.match(frame, o.minNcc)) continue;
+      this.replTried++;
+      if (!this.buildTemplate(this.ncc, j, k, x, y) || !this.ncc.match(frame, o.minNcc)) continue;
+      this.replFound++;
       this.idx[this.n] = j;
       this.pos[2 * this.n] = this.ncc.x;
       this.pos[2 * this.n + 1] = this.ncc.y;

@@ -9,6 +9,7 @@ import { mat3, mat3Mul, mat3Invert, so3Exp, rotationAngle } from '../src/math/ro
 import { Rng } from '../src/math/rng';
 import { invertSPD } from '../src/math/linalg';
 import { createGray, blur5 } from '../src/image/gray';
+import { buildKmTree, KmTreeSearcher } from '../src/vision/kmtree';
 
 const poster = getPoster();
 
@@ -293,5 +294,24 @@ describe('GL projection', () => {
         expect(py).toBeCloseTo((H - K.height * sy) / 2 + (p[1] + 0.5) * sy, 3);
       }
     }
+  });
+});
+
+describe('k-means tree search', () => {
+  it('ratio test ignores look-alikes that are not covisible', () => {
+    // Feature 1 is a near copy of feature 0 far away, feature 2 is random.
+    const rng = new Rng(9);
+    const desc = new Uint32Array(3 * 8);
+    for (let i = 0; i < 8; i++) { desc[i] = (rng.next() * 2 ** 32) >>> 0; desc[16 + i] = (rng.next() * 2 ** 32) >>> 0; }
+    desc.set(desc.subarray(0, 8), 8);
+    desc[8] ^= 0b111;
+    const kp = Float32Array.of(10, 10, 1, 0, 200, 50, 1, 0, 90, 90, 1, 0);
+    const tree = buildKmTree(desc, 3);
+    const q = desc.slice(0, 8);
+    const s = new KmTreeSearcher(16);
+    expect(s.search(tree, desc, kp, q, 0)).toBe(0);
+    expect(s.dist2).toBe(3); // ambiguous
+    expect(s.search(tree, desc, kp, q, 0, 6, (a, b) => a + b !== 1)).toBe(0);
+    expect(s.dist2).toBeGreaterThan(64); // only the random one competes
   });
 });

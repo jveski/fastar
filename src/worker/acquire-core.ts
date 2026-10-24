@@ -23,7 +23,7 @@ export class AcquireCore {
     const t0 = this.now();
     const r = acq.acquire(new Uint8Array(m.luma), { exclude: m.exclude, up: m.up });
     let result: WireAcquireResult | null = null;
-    if (r) result = { target: r.target, R: r.R, t: r.t, H: r.H, inliers: r.inliers, cov: r.cov, frame: r.frame, tgt: r.tgt };
+    if (r) result = { target: r.target, R: r.R, t: r.t, H: r.H, inliers: r.inliers, cov: r.cov, frame: r.frame, tgt: r.tgt, time: r.time };
     const msg: AcquireToTracker = { type: 'acquired', frameId: m.frameId, result, ms: this.now() - t0 };
     this.port!.postMessage(msg);
   }

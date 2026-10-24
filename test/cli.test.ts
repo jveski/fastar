@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { deflateSync } from 'node:zlib';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decodePng } from '../cli/png';
 import { getPoster } from './fixtures';
 import { decodeTargets } from '../src/target/format';
+import { makeMotionClip } from '../src/sim/motion';
 
 function crc32(b: Uint8Array): number {
   let c = ~0;
@@ -87,5 +88,50 @@ describe('fastar-compile CLI', () => {
     expect(t.meta.name).toBe('poster');
     expect(t.meta.physicalWidth).toBe(0.2);
     expect(JSON.parse(readFileSync(join(dir, 'r.json'), 'utf8'))[0].features).toBeGreaterThan(1000);
+  });
+});
+
+describe('fastar-compile CLI, video', () => {
+  const clip = makeMotionClip({ width: 320, height: 180, duration: 2 });
+  const load = (path: string) => {
+    const buf = readFileSync(path);
+    return decodeTargets(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  };
+
+  it('compiles a directory of frames, alongside an image', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fastar-'));
+    mkdirSync(join(dir, 'clip'));
+    for (let i = 0; i < clip.frameCount; i++) {
+      const f = clip.frame(i);
+      writeFileSync(join(dir, 'clip', `f${i + 1}.png`), encodePng(f.width, f.height, 1, f.data));
+    }
+    const img = getPoster();
+    writeFileSync(join(dir, 'poster.png'), encodePng(img.width, img.height, 1, img.data));
+    const out = execFileSync('npx', ['tsx', 'cli/compile.ts', '--fps', '30', '-o', join(dir, 't.bin'), join(dir, 'poster.png:0.2'), join(dir, 'clip:0.4')], {
+      encoding: 'utf8',
+    });
+    expect(out).toMatch(/clip: 320x180px video, 2.0 s at 30 fps, 0.4 m wide/);
+    const [a, b] = load(join(dir, 't.bin'));
+    expect(a.video).toBeUndefined();
+    expect(b.meta.video!.frameCount).toBe(60);
+    expect(b.meta.video!.changes).toEqual(clip.cuts);
+  });
+
+  const hasFfmpeg = spawnSync('ffmpeg', ['-version']).status === 0;
+  it.skipIf(!hasFfmpeg)('compiles a video file through ffmpeg', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fastar-'));
+    const raw = new Uint8Array(clip.width * clip.height * clip.frameCount);
+    for (let i = 0; i < clip.frameCount; i++) raw.set(clip.frame(i).data, i * clip.width * clip.height);
+    writeFileSync(join(dir, 'clip.gray'), raw);
+    execFileSync('ffmpeg', [
+      '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', `${clip.width}x${clip.height}`, '-r', '30', '-i', join(dir, 'clip.gray'),
+      '-c:v', 'mpeg4', '-q:v', '2', '-pix_fmt', 'yuv420p', join(dir, 'clip.mp4'),
+    ]);
+    const out = execFileSync('npx', ['tsx', 'cli/compile.ts', '-o', join(dir, 't.bin'), join(dir, 'clip.mp4:0.4')], { encoding: 'utf8' });
+    expect(out).toMatch(/clip: 320x180px video, 2.0 s at 30 fps/);
+    const [t] = load(join(dir, 't.bin'));
+    expect(t.meta.video!.frameCount).toBe(60);
+    expect(t.meta.video!.changes).toEqual(clip.cuts);
+    expect(t.meta.video!.report.minPoints).toBeGreaterThan(20);
   });
 });

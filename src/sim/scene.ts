@@ -132,6 +132,8 @@ export interface SimSceneOptions {
   poster: GrayImage;
   posterWidthM: number;
   seed?: number;
+  /** The poster is a screen playing this (frames the size of `poster`). */
+  textureAt?: (t: number) => GrayImage;
 }
 
 /** Wall + poster + optional occluder, wired to a scenario. */
@@ -144,7 +146,7 @@ export function createSceneRenderer(scn: Scenario, o: SimSceneOptions): Renderer
   };
   const planes: TexturedPlane[] = [
     { pose: () => behind(staticTarget(), 0.002), texture: wall, metersPerTexel: 0.002, tile: true },
-    { pose: scn.target, texture: o.poster, metersPerTexel: mpt },
+    { pose: scn.target, texture: o.poster, textureAt: o.textureAt, metersPerTexel: mpt },
   ];
   if (scn.occluded) {
     const occ = makeBackground(256, 777);

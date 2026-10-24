@@ -118,7 +118,7 @@ export class TrackerCore {
     return {
       type: 'result', frameId, t, doneAt: this.now() + this.clockOffset, targets, found, lost, timings,
       snapshots: p.slots.map((s) => ({ index: s.index, snap: s.eskf.exportSnapshot(s.eskf.t - 0.4) })),
-      td: p.td, tdCalibrated: p.tdCalibrated,
+      td: p.td, tdCalibrated: p.tdCalibrated, clocks: p.clockStates(),
     };
   }
 
@@ -165,7 +165,7 @@ export class TrackerCore {
         const arrival = this.now() + this.clockOffset;
         const tsMs = frame.timestamp / 1000;
         this.arrivalOffset = Math.min(this.arrivalOffset, arrival - tsMs);
-        const t = tsMs + (Number.isNaN(this.mediaOffset) ? this.arrivalOffset : this.mediaOffset);
+        const t = frameCaptureTime(tsMs, arrival, this.mediaOffset, this.arrivalOffset);
         const luma = await videoFrameToLuma(frame, this.width, this.height, this.luma!);
         frame.close();
         if (luma) this.onFrame(luma, t);
@@ -176,4 +176,17 @@ export class TrackerCore {
     }
     reader.releaseLock();
   }
+}
+
+/**
+ * Main-clock capture time (ms) of a VideoFrame with timestamp `tsMs`: from
+ * the rVFC mediaTime -> captureTime mapping when it is plausible (captured
+ * before it arrived, and less than a second before), else from the lower
+ * envelope of arrival times. Some cameras (Chrome's fake device, for one)
+ * stamp VideoFrames on a different base than rVFC's mediaTime.
+ */
+export function frameCaptureTime(tsMs: number, arrival: number, mediaOffset: number, arrivalOffset: number): number {
+  const viaMedia = tsMs + mediaOffset;
+  if (viaMedia === viaMedia && viaMedia <= arrival + 5 && arrival - viaMedia < 1000) return viaMedia;
+  return tsMs + arrivalOffset;
 }

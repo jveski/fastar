@@ -5,13 +5,14 @@ import { glProjection, intrinsicsFromFocal, lookupHfov, intrinsicsFromFov, poseT
 import { ImuBuffer } from '../fusion/imu';
 import { PosePredictor } from '../fusion/predict';
 import { RegularClock } from '../fusion/clock';
+import { videoTimeFromOffset } from '../fusion/video-clock';
 import { PoseSmoother, type SmoothingOptions } from '../fusion/smooth';
 import { MotionSensors, type Facing, type ImuReading, type MotionPermission, type SensorBackend } from './sensors';
 import { LumaGrabber, canUseTrackProcessor, createTrackProcessor, openCamera, processingSize } from './capture';
 import type { FromTracker, ResultMessage, ToTracker, AcquireInit } from '../worker/protocol';
 import type { EskfOptions } from '../fusion/eskf';
 import type { TrackerOptions } from '../track/tracker';
-import type { FrameTargetInfo } from '../track/pipeline';
+import type { ClockState, FrameTargetInfo } from '../track/pipeline';
 import { Recorder, type SessionLog } from './recorder';
 
 export interface CreateOptions {
@@ -65,6 +66,20 @@ export interface Pose {
   R: Float64Array;
   t: Float64Array;
   confidence: number;
+  /** Video targets: where the video is (s, in [0, duration)) in this frame. */
+  videoTime?: number;
+  /** Standard deviation of videoTime (s). */
+  videoTimeStd?: number;
+  /** videoTime is good to a fraction of a video frame. */
+  videoTimeLocked?: boolean;
+}
+
+export interface VideoTime {
+  /** Seconds into the clip, in [0, duration). */
+  time: number;
+  std: number;
+  locked: boolean;
+  duration: number;
 }
 
 export interface PresentedFrame {
@@ -157,6 +172,7 @@ export class ImageTracker {
   private readonly Rp = new Float64Array(9);
   private readonly tp = new Float64Array(3);
   private readonly confidence = new Map<number, number>();
+  private readonly clocks = new Map<number, ClockState>();
   private readonly shown = new Set<number>();
   private readonly listeners = { found: new Set<Listener>(), lost: new Set<Listener>() };
   private readonly frameListeners = new Set<(e: FrameEvent) => void>();
@@ -293,6 +309,7 @@ export class ImageTracker {
     this.predictors.clear();
     this.smoothers.clear();
     this.shown.clear();
+    this.clocks.clear();
     this.displayQueue.length = 0;
     this.lastResultTime = -Infinity;
     this.frameClock = null;
@@ -322,6 +339,17 @@ export class ImageTracker {
   getProjectionMatrix(viewW: number, viewH: number, near = 0.01, far = 100, fit: FitMode = this.fit): Float32Array {
     if (!this.intrinsics) return this.proj;
     return glProjection(this.intrinsics, viewW, viewH, near, far, fit, this.proj);
+  }
+
+  /**
+   * Video targets: where the video is in a frame captured at `captureTime`
+   * (ms, e.g. FrameEvent.presentedFrame.captureTime), or null before the
+   * video has been seen. Keeps running while the target is out of view.
+   */
+  videoTimeAt(index: number, captureTime: number): VideoTime | null {
+    const c = this.clocks.get(index);
+    if (!c) return null;
+    return { time: videoTimeFromOffset(c.offset, c.duration, captureTime / 1000), std: c.std, locked: c.locked, duration: c.duration };
   }
 
   /** Low level: target pose for a frame captured at `captureTime` (ms). */
@@ -431,6 +459,7 @@ export class ImageTracker {
       p.ingest(s.snap);
     }
     for (const r of m.targets) this.confidence.set(r.index, r.confidence);
+    for (const c of m.clocks ?? []) this.clocks.set(c.index, c);
     for (const i of m.lost) {
       this.predictors.delete(i);
       this.confidence.set(i, 0);
@@ -524,11 +553,18 @@ export class ImageTracker {
         const ok = Number.isFinite(tp) && this.poseAt(i, tp * 1000, this.Rp, this.tp);
         sm.update(captureTime / 1000, this.R, this.t, ok ? this.Rp : null, ok ? this.tp : null);
       }
-      poses.set(i, {
+      const pose: Pose = {
         matrix: poseToGl(this.R, this.t),
         R: this.R.slice(), t: this.t.slice(),
         confidence: this.confidence.get(i) ?? 0,
-      });
+      };
+      const vt = this.videoTimeAt(i, captureTime);
+      if (vt) {
+        pose.videoTime = vt.time;
+        pose.videoTimeStd = vt.std;
+        pose.videoTimeLocked = vt.locked;
+      }
+      poses.set(i, pose);
     }
     const ev: FrameEvent = {
       presentedFrame: {

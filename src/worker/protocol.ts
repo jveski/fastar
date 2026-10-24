@@ -1,9 +1,10 @@
 // Messages between the main thread, the tracking worker and the acquisition
 // worker. Times are main-thread performance.now() milliseconds.
 import type { Intrinsics } from '../vision/camera';
-import type { FrameTargetInfo, FrameTimings } from '../track/pipeline';
+import type { ClockState, FrameTargetInfo, FrameTimings } from '../track/pipeline';
 import type { EskfOptions } from '../fusion/eskf';
 import type { TrackerOptions } from '../track/tracker';
+import type { AcquireTime } from '../track/acquire';
 
 export interface TrackerInit {
   type: 'init';
@@ -57,6 +58,8 @@ export interface ResultMessage {
   snapshots: Array<{ index: number; snap: Float64Array }>;
   td: number;
   tdCalibrated: boolean;
+  /** Video targets' clocks (render side computes the video time of any frame). */
+  clocks: ClockState[];
   /** Luma buffer handed back for reuse (copy path). */
   buffer?: ArrayBuffer;
   /** Extra report sent right after an acquisition, not the result of a submitted frame. */
@@ -80,6 +83,7 @@ export interface WireAcquireResult {
   cov: Float64Array;
   frame: Float32Array;
   tgt: Float32Array;
+  time?: AcquireTime;
 }
 
 export type TrackerToAcquire =

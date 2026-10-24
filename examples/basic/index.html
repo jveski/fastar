@@ -2,6 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <script>
+      // Relative URLs below need the trailing slash; some static servers (serve's
+      // cleanUrls) answer /dir with /dir/index.html without redirecting.
+      if (!location.pathname.endsWith('/') && !/\.\w+$/.test(location.pathname)) location.replace(location.pathname + '/' + location.search + location.hash);
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>fastar – minimal example</title>
     <style>

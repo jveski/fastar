@@ -3,6 +3,8 @@
 import type { GrayImage } from '../image/gray';
 import type { Intrinsics } from '../vision/camera';
 import { compileTarget } from '../target/compiler';
+import { compileVideoTarget } from '../target/video-compiler';
+import type { VideoClip } from './motion';
 import type { TargetData } from '../target/format';
 import { Acquirer } from '../track/acquire';
 import { Pipeline, type PipelineOptions } from '../track/pipeline';
@@ -27,6 +29,40 @@ export interface RunOptions {
   onFrame?: (p: Pipeline, tCam: number, tTrue: number) => void;
   /** Initial t_d guess given to the pipeline. */
   tdGuess?: number;
+  /** The target is a screen playing a looping clip (`poster` is ignored). */
+  video?: SimVideo;
+}
+
+export interface SimVideo {
+  clip: VideoClip;
+  /** Scene time at which the clip's frame 0 starts. */
+  start: number;
+  /** Pause on the last frame at each loop seam (s). */
+  loopGap?: number;
+  /** Seeks: at scene time t the playback jumps by dt seconds. */
+  jumps?: Array<[number, number]>;
+  target?: TargetData;
+}
+
+/** True video time shown at scene time t. */
+export function videoTimeAt(v: SimVideo, t: number): number {
+  const D = v.clip.duration, P = D + (v.loopGap ?? 0);
+  let x = t - v.start;
+  for (const [at, dt] of v.jumps ?? []) if (t >= at) x += dt;
+  const ph = (x % P + P) % P;
+  return Math.min(ph, D - 1e-9);
+}
+
+const videoTargets = new WeakMap<VideoClip, Map<number, TargetData>>();
+export function videoTargetFor(clip: VideoClip, widthM: number): TargetData {
+  let m = videoTargets.get(clip);
+  if (!m) videoTargets.set(clip, (m = new Map()));
+  let t = m.get(widthM);
+  if (!t) {
+    const frames = Array.from({ length: clip.frameCount }, (_, i) => clip.frame(i));
+    m.set(widthM, (t = compileVideoTarget(frames, { physicalWidth: widthM, fps: clip.fps })));
+  }
+  return t;
 }
 
 export interface FrameLog {
@@ -42,6 +78,10 @@ export interface FrameLog {
   inliers: number;
   acquired: boolean;
   trackMs: number;
+  /** Video: true and estimated video time (s), and whether the estimate is locked. */
+  videoTruth: number;
+  videoTime: number;
+  videoLocked: boolean;
 }
 
 export interface RunResult {
@@ -65,8 +105,14 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
   const fps = o.fps ?? 30;
   const td = o.td ?? 0;
   const K = o.K;
-  const target = o.target ?? targetFor(o.poster, o.posterWidthM);
-  const renderer = createSceneRenderer(scn, { K, poster: o.poster, posterWidthM: o.posterWidthM });
+  const v = o.video;
+  const target = o.target ?? (v ? v.target ?? videoTargetFor(v.clip, o.posterWidthM) : targetFor(o.poster, o.posterWidthM));
+  const poster = v ? v.clip.frame(0) : o.poster;
+  const renderer = createSceneRenderer(scn, {
+    K, poster, posterWidthM: o.posterWidthM,
+    // The epsilon keeps rounding from flipping between frames at a frame change.
+    textureAt: v ? (t) => v.clip.frame(Math.floor(videoTimeAt(v, t) * v.clip.fps + 1e-6)) : undefined,
+  });
   const pipeline = new Pipeline([target], K, { width: K.width, height: K.height, useImu: !!o.useImu, ...o.pipeline });
   pipeline.td = o.tdGuess ?? 0;
   const acq = new Acquirer([target], K.width, K.height, K);
@@ -74,8 +120,8 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
   let imuIdx = 0;
   const frames: FrameLog[] = [];
   let acquisitions = 0, attempts = 0, firstLock = NaN;
-  const corners = [-1, -1, 1, -1, 1, 1, -1, 1].map((v, i) =>
-    i % 2 === 0 ? (v * o.posterWidthM) / 2 : (v * o.posterWidthM * (o.poster.height / o.poster.width)) / 2);
+  const corners = [-1, -1, 1, -1, 1, 1, -1, 1].map((c, i) =>
+    i % 2 === 0 ? (c * o.posterWidthM) / 2 : (c * o.posterWidthM * (poster.height / poster.width)) / 2);
   const estR = mat3(), estT = vec3();
   const pe = new Float32Array(2), pg = new Float32Array(2);
   const nFrames = Math.floor(scn.duration * fps);
@@ -117,9 +163,13 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
       tErr = Math.hypot(estT[0] - gt.t[0], estT[1] - gt.t[1], estT[2] - gt.t[2]);
       rErr = (rotationAngle(estR, gt.R) * 180) / Math.PI;
     }
+    const info = res.targets.find((x) => x.index === 0);
     frames.push({
       t: tTrue, tCam, visible, status: s?.status ?? 'none', overlayErrPx: overlay, transErr: tErr, rotErrDeg: rErr,
       estT: estT.slice(), estR: estR.slice(), inliers: s?.tracker.inliers ?? 0, acquired, trackMs: res.timings.total,
+      videoTruth: v ? videoTimeAt(v, tTrue) : NaN,
+      videoTime: info?.videoTime ?? NaN,
+      videoLocked: !!info?.videoLocked,
     });
   }
   return { frames, acquisitions, acquireAttempts: attempts, firstLockTime: firstLock, pipeline };

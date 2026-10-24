@@ -1,4 +1,7 @@
-import { compileImages } from './fastar.js';
+// The built site has fastar.js next to this file; served from the repository root
+// (site/compile.html), it comes from dist/ (run npm run build first).
+const fromSource = /\/site\//.test(location.pathname);
+const { compileImage, compileVideo, encodeTargets } = await import(new URL(fromSource ? '../dist/fastar.js' : './fastar.js', import.meta.url).href);
 
 const $ = (id) => document.getElementById(id);
 const items = [];
@@ -6,14 +9,24 @@ let outputUrl = null;
 
 function addFiles(files) {
   for (const file of files) {
-    if (!file.type.startsWith('image/')) continue;
-    const item = { file, url: URL.createObjectURL(file), name: file.name.replace(/\.[^.]+$/, ''), widthCm: 20, aspect: 0 };
-    const img = new Image();
-    img.onload = () => {
-      item.aspect = img.naturalHeight / img.naturalWidth;
-      render();
-    };
-    img.src = item.url;
+    const video = file.type.startsWith('video/');
+    if (!video && !file.type.startsWith('image/')) continue;
+    const item = { file, video, url: URL.createObjectURL(file), name: file.name.replace(/\.[^.]+$/, ''), widthCm: video ? 100 : 20, aspect: 0, fps: '' };
+    if (video) {
+      const v = Object.assign(document.createElement('video'), { muted: true, preload: 'metadata', src: item.url });
+      v.onloadedmetadata = () => {
+        item.aspect = v.videoHeight / v.videoWidth;
+        item.duration = v.duration;
+        render();
+      };
+    } else {
+      const img = new Image();
+      img.onload = () => {
+        item.aspect = img.naturalHeight / img.naturalWidth;
+        render();
+      };
+      img.src = item.url;
+    }
     items.push(item);
   }
   render();
@@ -22,8 +35,11 @@ function addFiles(files) {
 function render() {
   $('images').replaceChildren(...items.map((item, i) => {
     const li = document.createElement('li');
-    const img = Object.assign(document.createElement('img'), { src: item.url, alt: '' });
+    const img = item.video
+      ? Object.assign(document.createElement('video'), { src: `${item.url}#t=0.1`, muted: true, preload: 'metadata' })
+      : Object.assign(document.createElement('img'), { src: item.url, alt: '' });
     const name = Object.assign(document.createElement('span'), { className: 'name', textContent: item.name });
+    if (item.video && item.duration) name.append(Object.assign(document.createElement('span'), { className: 'muted', textContent: ` · ${item.duration.toFixed(1)} s video` }));
     if (items.length > 1) name.prepend(Object.assign(document.createElement('span'), { className: 'muted', textContent: `#${i} ` }));
 
     const size = document.createElement('span');
@@ -33,7 +49,7 @@ function render() {
       height.textContent = item.aspect && item.widthCm > 0 ? ` × ${(item.widthCm * item.aspect).toFixed(1)} cm` : ' cm';
     };
     const width = Object.assign(document.createElement('input'), {
-      type: 'number', value: String(item.widthCm), min: '0.1', step: '0.1', title: 'Printed width (cm)',
+      type: 'number', value: String(item.widthCm), min: '0.1', step: '0.1', title: item.video ? 'Width on screen (cm)' : 'Printed width (cm)',
     });
     width.oninput = () => {
       item.widthCm = parseFloat(width.value);
@@ -42,6 +58,17 @@ function render() {
     };
     showHeight();
     size.append(width, height);
+    if (item.video) {
+      const fps = Object.assign(document.createElement('input'), {
+        type: 'number', value: item.fps, min: '1', step: '0.001', placeholder: 'auto', title: 'Frame rate (blank: detect)',
+      });
+      fps.className = 'fps';
+      fps.oninput = () => {
+        item.fps = fps.value;
+        changed();
+      };
+      size.append(' ', fps, Object.assign(document.createElement('span'), { className: 'muted', textContent: ' fps' }));
+    }
 
     const remove = Object.assign(document.createElement('button'), { className: 'remove', textContent: '✕', title: 'Remove' });
     remove.onclick = () => {
@@ -93,15 +120,28 @@ $('compile').onclick = async () => {
   // Let the status paint: compiling blocks the main thread.
   await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
   try {
-    const { buffer, targets } = await compileImages(
-      items.map((it) => ({ image: it.file, physicalWidth: it.widthCm / 100, name: it.name })),
-    );
+    const targets = [];
+    for (const it of items) {
+      const o = { physicalWidth: it.widthCm / 100, name: it.name };
+      if (it.video) {
+        status.textContent = `Compiling ${it.name}…`;
+        targets.push(await compileVideo(it.file, {
+          ...o,
+          fps: parseFloat(it.fps) || undefined,
+          onProgress: (done, total) => { status.textContent = `Compiling ${it.name}: frame ${done} of ${total}`; },
+        }));
+        it.poster = await firstFrame(it.url);
+      } else {
+        targets.push(await compileImage(it.file, o));
+      }
+    }
+    const buffer = encodeTargets(targets);
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     outputUrl = URL.createObjectURL(new Blob([buffer], { type: 'application/octet-stream' }));
     $('download').href = outputUrl;
     $('download').textContent = `Download targets.bin (${formatBytes(buffer.byteLength)})`;
     $('try').href = `demo/?targets=${encodeURIComponent(outputUrl)}`;
-    $('targets').replaceChildren(...targets.map((t, i) => report(t, i, targets.length > 1)));
+    $('targets').replaceChildren(...targets.map((t, i) => report(t, i, targets.length > 1, items[i])));
     $('result').hidden = false;
     status.textContent = '';
   } catch (e) {
@@ -112,8 +152,8 @@ $('compile').onclick = async () => {
   }
 };
 
-function report(t, index, numbered) {
-  const q = t.meta.quality;
+function report(t, index, numbered, item) {
+  const q = t.meta.quality, v = t.meta.video;
   const el = document.createElement('div');
   el.className = 'target';
   const summary = document.createElement('p');
@@ -123,11 +163,55 @@ function report(t, index, numbered) {
     : Object.assign(document.createElement('span'), { className: 'ok', textContent: 'Looks good' });
   const facts = Object.assign(document.createElement('span'), {
     className: 'muted',
-    textContent: ` (${q.features} features, ${Math.round(q.coverage * 100)}% coverage, ${q.trackingPoints} tracking points)`,
+    textContent: v
+      ? ` (${v.duration.toFixed(1)} s at ${+v.fps.toFixed(3)} fps, ${q.features} features over ${v.keyframes.length} keyframes, ` +
+        `${v.report.points} tracking points, at least ${v.report.minPoints} on screen, ${v.changes.length} cut${v.changes.length === 1 ? '' : 's'})`
+      : ` (${q.features} features, ${Math.round(q.coverage * 100)}% coverage, ${q.trackingPoints} tracking points)`,
   });
   summary.append(title, ': ', verdict, facts);
-  el.append(summary, preview(t));
+  el.append(summary, v ? videoPreview(t, item.poster) : preview(t));
   return el;
+}
+
+/** First frame of a video, as a canvas. */
+async function firstFrame(url) {
+  const v = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: url });
+  await new Promise((r, j) => { v.onloadeddata = r; v.onerror = j; });
+  v.currentTime = 0.5 / 30;
+  await new Promise((r) => { v.onseeked = r; });
+  const c = Object.assign(document.createElement('canvas'), { width: v.videoWidth, height: v.videoHeight });
+  c.getContext('2d').drawImage(v, 0, 0);
+  return c;
+}
+
+/** First frame with the features and tracking points on screen then. */
+function videoPreview(t, poster) {
+  const { width, height } = t.meta;
+  const canvas = Object.assign(document.createElement('canvas'), { width, height });
+  const ctx = canvas.getContext('2d');
+  if (poster) {
+    ctx.filter = 'grayscale(1) contrast(0.75) brightness(1.1)';
+    ctx.drawImage(poster, 0, 0, width, height);
+    ctx.filter = 'none';
+  }
+  const r = Math.max(2, width / 300);
+  ctx.lineWidth = Math.max(1, r / 2);
+  ctx.strokeStyle = '#ff9f1c';
+  const range = t.video.featureRange;
+  for (let i = 0; i < t.kp.length / 4; i++) {
+    if (range[2 * i] !== 0) continue;
+    ctx.beginPath();
+    ctx.arc(t.kp[4 * i] + 0.5, t.kp[4 * i + 1] + 0.5, r * Math.sqrt(t.kp[4 * i + 2]), 0, 2 * Math.PI);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#2ec4b6';
+  const pts = t.video.points, path = t.video.path;
+  for (let j = 0; j < pts.length; j += 8) {
+    if (pts[j] !== 0) continue;
+    const o = pts[j + 2] * 3;
+    ctx.fillRect(path[o + 1] + 0.5 - r, path[o + 2] + 0.5 - r, 2 * r, 2 * r);
+  }
+  return canvas;
 }
 
 /** The largest tracking image with features and tracking points drawn on it. */

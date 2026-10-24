@@ -108,8 +108,40 @@ export function compileTargets(list: Array<{ image: GrayImage } & CompileOptions
  * rejecting points whose patch resembles nearby patches (self-NCC).
  */
 export function selectTrackingPoints(img: GrayImage, count: number): number[] {
+  const w = img.width, h = img.height;
+  const margin = 14;
+  const { cands, score } = cornerCandidates(img, margin);
+  cands.sort((a, b) => score[b] - score[a]);
+  const cell = Math.max(8, Math.floor(Math.sqrt(((w - 2 * margin) * (h - 2 * margin)) / (count * 1.2))));
+  const gw = Math.ceil(w / cell);
+  const used = new Map<number, number>();
+  const out: number[] = [];
+  for (let pass = 0; pass < 2 && out.length < 2 * count; pass++) {
+    for (const p of cands) {
+      if (out.length >= 2 * count) break;
+      if (p < 0) continue;
+      const x = p % w, y = (p / w) | 0;
+      const c = ((y / cell) | 0) * gw + ((x / cell) | 0);
+      if ((used.get(c) ?? 0) >= (pass === 0 ? 1 : 3)) continue;
+      if (selfSimilar(img, x, y)) continue;
+      // Keep points apart.
+      let near = false;
+      for (let k = 0; k < out.length; k += 2) if (Math.abs(out[k] - x) < 5 && Math.abs(out[k + 1] - y) < 5) { near = true; break; }
+      if (near) continue;
+      used.set(c, (used.get(c) ?? 0) + 1);
+      out.push(x, y);
+    }
+  }
+  return out;
+}
+
+/**
+ * Shi-Tomasi score (min eigenvalue of the 9x9 structure tensor) and the 5x5
+ * local maxima above ~5 grey levels/px in the weakest direction.
+ */
+export function cornerCandidates(img: GrayImage, margin: number): { cands: number[]; score: Float32Array } {
   const w = img.width, h = img.height, d = img.data;
-  const R = 4, margin = 14;
+  const R = 4;
   const n = w * h;
   const ixx = new Float64Array((w + 1) * (h + 1)), iyy = new Float64Array((w + 1) * (h + 1)), ixy = new Float64Array((w + 1) * (h + 1));
   const W1 = w + 1;
@@ -151,32 +183,11 @@ export function selectTrackingPoints(img: GrayImage, count: number): number[] {
       if (isMax) cands.push(p);
     }
   }
-  cands.sort((a, b) => score[b] - score[a]);
-  const cell = Math.max(8, Math.floor(Math.sqrt(((w - 2 * margin) * (h - 2 * margin)) / (count * 1.2))));
-  const gw = Math.ceil(w / cell);
-  const used = new Map<number, number>();
-  const out: number[] = [];
-  for (let pass = 0; pass < 2 && out.length < 2 * count; pass++) {
-    for (const p of cands) {
-      if (out.length >= 2 * count) break;
-      if (p < 0) continue;
-      const x = p % w, y = (p / w) | 0;
-      const c = ((y / cell) | 0) * gw + ((x / cell) | 0);
-      if ((used.get(c) ?? 0) >= (pass === 0 ? 1 : 3)) continue;
-      if (selfSimilar(img, x, y)) continue;
-      // Keep points apart.
-      let near = false;
-      for (let k = 0; k < out.length; k += 2) if (Math.abs(out[k] - x) < 5 && Math.abs(out[k + 1] - y) < 5) { near = true; break; }
-      if (near) continue;
-      used.set(c, (used.get(c) ?? 0) + 1);
-      out.push(x, y);
-    }
-  }
-  return out;
+  return { cands, score };
 }
 
 /** True if the 9x9 patch at (x, y) matches a shifted patch 3..8 px away with NCC > 0.85. */
-function selfSimilar(img: GrayImage, x: number, y: number): boolean {
+export function selfSimilar(img: GrayImage, x: number, y: number): boolean {
   const w = img.width, d = img.data;
   const R = 4, N = 81;
   let s = 0, s2 = 0;
@@ -213,7 +224,17 @@ function qualityReport(
     grid[gy * 8 + gx] = 1;
   }
   const coverage = grid.reduce((a, b) => a + b, 0) / 64;
-  // Self-similarity on a deterministic sample of descriptors.
+  const selfSim = selfSimilarity(kp, desc, n, W, H);
+  const warnings: string[] = [];
+  if (n < 150) warnings.push(`few features (${n}); use a more detailed image`);
+  if (coverage < 0.5) warnings.push(`features cover only ${(coverage * 100).toFixed(0)}% of the target`);
+  if (selfSim > 0.25) warnings.push(`repetitive texture (${(selfSim * 100).toFixed(0)}% of features have look-alikes)`);
+  if (trackingPoints < 60) warnings.push(`only ${trackingPoints} tracking points; tracking may be unstable`);
+  return { features: n, featuresPerLevel: perLevel, coverage, selfSimilarity: selfSim, trackingPoints, warnings };
+}
+
+/** Fraction of a deterministic sample of descriptors with a near-identical twin elsewhere on the image. */
+export function selfSimilarity(kp: Float32Array, desc: Uint32Array, n: number, W: number, H: number): number {
   const sample = Math.min(n, 300);
   let similar = 0;
   const minSep = 0.05 * Math.max(W, H);
@@ -227,11 +248,5 @@ function qualityReport(
     }
     if (best < 24) similar++;
   }
-  const selfSimilarity = sample ? similar / sample : 0;
-  const warnings: string[] = [];
-  if (n < 150) warnings.push(`few features (${n}); use a more detailed image`);
-  if (coverage < 0.5) warnings.push(`features cover only ${(coverage * 100).toFixed(0)}% of the target`);
-  if (selfSimilarity > 0.25) warnings.push(`repetitive texture (${(selfSimilarity * 100).toFixed(0)}% of features have look-alikes)`);
-  if (trackingPoints < 60) warnings.push(`only ${trackingPoints} tracking points; tracking may be unstable`);
-  return { features: n, featuresPerLevel: perLevel, coverage, selfSimilarity, trackingPoints, warnings };
+  return sample ? similar / sample : 0;
 }

@@ -22,3 +22,17 @@ Shipped as a single ES module with no dependencies. Import it as below, or downl
 </script>
 ```
 
+## Video targets
+
+Short looping videos work as targets too, and poses report where the video is in its playback. Nothing in the video needs to hold still: tracking works even when the whole picture keeps changing. [Demo](https://jveski.github.io/fastar/demo/video.html) · [example](examples/video)
+
+```sh
+npx fastar-compile -o targets.bin loop.mp4:1.2  # needs ffmpeg; or compileVideo() in the browser
+```
+
+```js
+ar.onFrame(({ poses }) => {
+  const p = poses.get(0);
+  if (p?.videoTimeLocked) console.log(p.videoTime); // seconds into the clip
+});
+```

@@ -84,6 +84,11 @@ cpSync('site', 'dist/site', { recursive: true });
 copyFileSync('dist/fastar.js', 'dist/site/fastar.js');
 copyFileSync('examples/basic/target.png', 'dist/site/demo/target.png');
 copyFileSync('examples/basic/targets.bin', 'dist/site/demo/targets.bin');
+mkdirSync('dist/site/demo/video', { recursive: true });
+copyFileSync('examples/video/clip.mp4', 'dist/site/demo/video/clip.mp4');
+copyFileSync('examples/video/targets.bin', 'dist/site/demo/video/targets.bin');
+copyFileSync('examples/video/scene.json', 'dist/site/demo/video/scene.json');
+copyFileSync('examples/video/overlay.js', 'dist/site/demo/video/overlay.js');
 
 execFileSync('npx', ['tsc', '-p', 'tsconfig.build.json'], { stdio: 'inherit' });
 

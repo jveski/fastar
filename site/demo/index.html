@@ -2,6 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <script>
+      // Relative URLs below need the trailing slash; some static servers (serve's
+      // cleanUrls) answer /dir with /dir/index.html without redirecting.
+      if (!location.pathname.endsWith('/') && !/\.\w+$/.test(location.pathname)) location.replace(location.pathname + '/' + location.search + location.hash);
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Demo – fastar</title>
     <link rel="stylesheet" href="../style.css" />
@@ -24,6 +29,7 @@
       <a href="https://github.com/jveski/fastar">fastar</a>
       <a href="../compile.html">Compiler</a>
       <a href="./" aria-current="page">Demo</a>
+      <a href="video.html">Video demo</a>
     </header>
     <main>
       <h1>Demo</h1>
@@ -35,7 +41,7 @@
         <button id="start" disabled>Start</button>
         <span id="error" class="warn"></span>
       </div>
-      <img id="target" src="target.png" alt="Demo target image" />
+      <img id="target" alt="Demo target image" />
       <p class="muted">
         <a href="https://github.com/jveski/fastar/blob/main/site/demo/index.html">View this page's source</a>
         for a complete example.
@@ -51,9 +57,21 @@
 
     <script type="module">
       import * as THREE from 'three';
-      import { ImageTracker, ThreeAdapter } from '../fastar.js';
 
       const $ = (id) => document.getElementById(id);
+      // The built site (dist/site) has the library and the target next to this page;
+      // served from the repository root (site/demo/), they come from dist/ and examples/.
+      const fromSource = /\/site\/demo\//.test(location.pathname);
+      const at = (path) => new URL(path, location.href).href;
+      const lib = at(fromSource ? '../../dist/fastar.js' : '../fastar.js');
+      const assets = fromSource ? '../../examples/basic/' : './';
+      const { ImageTracker, ThreeAdapter } = await import(lib).catch((err) => {
+        $('error').textContent = fromSource
+          ? `Could not load ${lib} (run npm run build first): ${err.message}`
+          : `Could not load the demo: ${err.message}`;
+        throw err;
+      });
+      $('target').src = at(assets + 'target.png');
 
       // ?targets=<url> loads another targets file (the compiler links here with its output).
       const custom = new URLSearchParams(location.search).get('targets');
@@ -69,7 +87,7 @@
       const camera = new THREE.PerspectiveCamera();
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
 
-      const ar = await ImageTracker.create({ targets: custom ?? './targets.bin' }).catch((err) => {
+      const ar = await ImageTracker.create({ targets: custom ?? at(assets + 'targets.bin') }).catch((err) => {
         $('error').textContent = `Could not load the targets: ${err.message}`;
         throw err;
       });

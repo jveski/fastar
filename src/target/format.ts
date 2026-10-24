@@ -6,9 +6,18 @@
 //
 // Section tags: META (UTF-8 JSON), KPTS (f32 [x,y,scale,angle]), DESC (u32 x8),
 // TREE (i32), IMG0..IMG2 (u8 greyscale), TPTS (f32 [x,y]).
+//
+// Version 2 adds video targets (META.video set), which carry no images or
+// TPTS points but these sections instead:
+//   KFRG  u16 [first, last] keyframe per feature (last >= keyframe count: continues through the loop seam)
+//   VPTS  u32 [start, end, pathOffset, pathCount, patchOffset, patchCount, flags, 0] per point
+//   VPTH  f32 [frame, x, y] path vertices (frames unwrapped past the loop end)
+//   VPIX  u32 [frame, byteOffset] per patch snapshot
+//   VPCH  u8 patch pixels (patchScales.length levels of patchSize^2 each)
+// Files holding only image targets are still written as version 1.
 
 export const MAGIC = 0x52545346; // 'FSTR' little-endian
-export const FORMAT_VERSION = 1;
+export const FORMAT_VERSION = 2;
 
 export interface TargetImageInfo {
   width: number;
@@ -38,7 +47,50 @@ export interface TargetMeta {
   levelScales: number[];
   images: TargetImageInfo[];
   quality: QualityReport;
+  /** Present on video targets. */
+  video?: VideoMeta;
 }
+
+export interface VideoMeta {
+  fps: number;
+  frameCount: number;
+  /** frameCount / fps (s). */
+  duration: number;
+  loop: boolean;
+  /** Frame index of each keyframe (ascending). */
+  keyframes: number[];
+  /** Frames where the content changed abruptly (cuts). */
+  changes: number[];
+  /** Patch side in pixels and the base pixels per patch pixel of each level. */
+  patchSize: number;
+  patchScales: number[];
+  report: VideoQualityReport;
+}
+
+export interface VideoQualityReport {
+  points: number;
+  movingPoints: number;
+  keyframes: number;
+  /** Fewest tracking points visible in any frame. */
+  minPoints: number;
+  /** Per second of video: the fewest points visible in a frame of that second. */
+  pointsPerSecond: number[];
+  /** Per second of video: whether moving or changing content lets the clock be refined. */
+  timingPerSecond: boolean[];
+}
+
+/** Video targets: keyframe ranges of the features and the baked tracking points. */
+export interface VideoData {
+  featureRange: Uint16Array;
+  points: Uint32Array;
+  path: Float32Array;
+  patchIndex: Uint32Array;
+  patches: Uint8Array;
+}
+
+export const VPT_STRIDE = 8;
+/** VPTS flags. */
+export const VPT_STATIONARY = 1;
 
 export interface TargetData {
   meta: TargetMeta;
@@ -47,6 +99,7 @@ export interface TargetData {
   tree: Int32Array;
   images: Uint8Array[];
   trackPoints: Float32Array;
+  video?: VideoData;
 }
 
 const tag = (s: string) => s.charCodeAt(0) | (s.charCodeAt(1) << 8) | (s.charCodeAt(2) << 16) | (s.charCodeAt(3) << 24);
@@ -59,7 +112,7 @@ export function encodeTargets(targets: TargetData[]): ArrayBuffer {
   const buf = new ArrayBuffer(total);
   const dv = new DataView(buf);
   dv.setUint32(0, MAGIC, true);
-  dv.setUint32(4, FORMAT_VERSION, true);
+  dv.setUint32(4, targets.some((t) => t.video) ? FORMAT_VERSION : 1, true);
   dv.setUint32(8, targets.length, true);
   let off = headerSize;
   blocks.forEach((b, i) => {
@@ -80,6 +133,16 @@ function encodeTarget(t: TargetData): Uint8Array {
     ...t.images.map((im, i): [string, Uint8Array] => [`IMG${i}`, im]),
     ['TPTS', bytes(t.trackPoints)],
   ];
+  if (t.video) {
+    const v = t.video;
+    sections.push(
+      ['KFRG', bytes(v.featureRange)],
+      ['VPTS', bytes(v.points)],
+      ['VPTH', bytes(v.path)],
+      ['VPIX', bytes(v.patchIndex)],
+      ['VPCH', v.patches],
+    );
+  }
   const size = sections.reduce((s, [, d]) => s + 8 + pad8(d.byteLength), 0);
   const out = new Uint8Array(size);
   const dv = new DataView(out.buffer);
@@ -102,7 +165,7 @@ export function decodeTargets(buf: ArrayBuffer): TargetData[] {
   const dv = new DataView(buf);
   if (dv.getUint32(0, true) !== MAGIC) throw new Error('fastar: not a targets file');
   const version = dv.getUint32(4, true);
-  if (version !== FORMAT_VERSION) throw new Error(`fastar: unsupported targets version ${version}`);
+  if (version < 1 || version > FORMAT_VERSION) throw new Error(`fastar: unsupported targets version ${version}`);
   const count = dv.getUint32(8, true);
   const out: TargetData[] = [];
   for (let i = 0; i < count; i++) {
@@ -129,14 +192,29 @@ export function decodeTargets(buf: ArrayBuffer): TargetData[] {
       const [io, inn] = get(`IMG${k}`);
       return new Uint8Array(buf, io, inn);
     });
-    out.push({
+    const t: TargetData = {
       meta,
       kp: new Float32Array(buf, ko, kn / 4),
       desc: new Uint32Array(buf, d0, dn / 4),
       tree: new Int32Array(buf, to, tn / 4),
       images,
       trackPoints: new Float32Array(buf, po, pn / 4),
-    });
+    };
+    if (meta.video) {
+      const [fo, fn] = get('KFRG');
+      const [vo, vn] = get('VPTS');
+      const [ho, hn] = get('VPTH');
+      const [xo, xn] = get('VPIX');
+      const [co, cn] = get('VPCH');
+      t.video = {
+        featureRange: new Uint16Array(buf, fo, fn / 2),
+        points: new Uint32Array(buf, vo, vn / 4),
+        path: new Float32Array(buf, ho, hn / 4),
+        patchIndex: new Uint32Array(buf, xo, xn / 4),
+        patches: new Uint8Array(buf, co, cn),
+      };
+    }
+    out.push(t);
   }
   return out;
 }

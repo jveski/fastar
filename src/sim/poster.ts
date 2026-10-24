@@ -3,7 +3,7 @@
 import { createGray, type GrayImage } from '../image/gray';
 import { Rng } from '../math/rng';
 
-export function makePoster(width: number, height: number, seed = 7): GrayImage {
+export function makePoster(width: number, height: number, seed = 7, noise = 6, shapes = 140): GrayImage {
   const rng = new Rng(seed);
   const img = createGray(width, height);
   const d = img.data;
@@ -15,7 +15,6 @@ export function makePoster(width: number, height: number, seed = 7): GrayImage {
     }
   }
   const scale = Math.min(width, height);
-  const shapes = 140;
   for (let s = 0; s < shapes; s++) {
     const kind = rng.int(4);
     const val = rng.range(0, 255);
@@ -49,7 +48,7 @@ export function makePoster(width: number, height: number, seed = 7): GrayImage {
     }
   }
   // Fine noise so textured areas exist at every scale.
-  for (let i = 0; i < d.length; i++) d[i] = clamp(d[i] + rng.gauss() * 6);
+  if (noise > 0) for (let i = 0; i < d.length; i++) d[i] = clamp(d[i] + rng.gauss() * noise);
   return img;
 }
 

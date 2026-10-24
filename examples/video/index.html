@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <script>
+      // Relative URLs below need the trailing slash; some static servers (serve's
+      // cleanUrls) answer /dir with /dir/index.html without redirecting.
+      if (!location.pathname.endsWith('/') && !/\.\w+$/.test(location.pathname)) location.replace(location.pathname + '/' + location.search + location.hash);
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>fastar – video example</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+      video, canvas { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      button { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 14px 22px; font: 16px system-ui; }
+      #status { position: fixed; left: 8px; right: 8px; bottom: 8px; margin: 0; color: #fff; font: 12px ui-monospace, monospace; white-space: pre-wrap; text-shadow: 0 0 3px #000; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <video id="video" muted playsinline></video>
+    <canvas id="gl"></canvas>
+    <button id="start">Start AR</button>
+    <pre id="status"></pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter } from '../../dist/fastar.js';
+      import { createOverlay } from './overlay.js';
+
+      const canvas = document.getElementById('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+
+      const [ar, sceneInfo] = await Promise.all([
+        ImageTracker.create({ targets: './targets.bin' }),
+        fetch('./scene.json').then((r) => r.json()),
+      ]);
+      // The cube, kept in step with the clip by the video time recovered from the camera.
+      const overlay = createOverlay(THREE, ar.targets[0], sceneInfo);
+      scene.add(overlay.root);
+
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        render: (e) => {
+          // videoTime: where the clip is in this camera frame (seconds).
+          const p = e.poses.get(0);
+          overlay.update(p?.videoTimeLocked ? p.videoTime : null);
+          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          renderer.render(scene, camera);
+        },
+      });
+      three.anchor(0, overlay.root);
+
+      const status = document.getElementById('status');
+      document.getElementById('start').onclick = async (e) => {
+        e.target.remove();
+        try {
+          await ar.start({ video: document.getElementById('video'), requestMotionPermission: true, syncDisplay: true });
+        } catch (err) {
+          status.textContent = String(err);
+          throw err;
+        }
+        setInterval(() => {
+          const s = ar.stats;
+          const vt = ar.videoTimeAt(0, performance.now());
+          const clock = vt ? `video ${vt.time.toFixed(2)} s ${vt.locked ? `(±${(vt.std * 1000).toFixed(0)} ms)` : '(locking…)'}` : 'video not seen yet';
+          const t = s.targets.map((r) => r.status).join('; ') || 'searching';
+          status.textContent = `${s.fps} fps | ${t} | ${clock}`;
+        }, 250);
+      };
+    </script>
+  </body>
+</html>

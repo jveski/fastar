@@ -11,9 +11,10 @@
       .drop input { display: none; }
       #images { list-style: none; padding: 0; margin: 0; }
       #images li { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
-      #images img { width: 64px; height: 48px; object-fit: contain; background: var(--soft); border-radius: 4px; flex: none; }
+      #images img, #images video { width: 64px; height: 48px; object-fit: contain; background: var(--soft); border-radius: 4px; flex: none; }
       #images .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #images input { width: 5.5em; }
+      #images input.fps { width: 4.5em; }
       #images .remove { background: none; color: var(--muted); padding: 4px 8px; }
       .target { margin: 24px 0; }
       .target p { margin: 0 0 8px; }
@@ -25,17 +26,19 @@
       <a href="https://github.com/jveski/fastar">fastar</a>
       <a href="compile.html" aria-current="page">Compiler</a>
       <a href="demo/">Demo</a>
+      <a href="demo/video.html">Video demo</a>
     </header>
     <main>
       <h1>Target compiler</h1>
       <p class="muted">
-        Turn images into a <code>targets.bin</code>. Enter the width each image will be printed or shown at, so
-        poses come out in metres. Runs in your browser; nothing is uploaded.
+        Turn images and short looping videos into a <code>targets.bin</code>. Enter the width each will be printed
+        or shown at, so poses come out in metres. Videos are read frame by frame, which takes about as long as the
+        clip plays. Runs in your browser; nothing is uploaded.
       </p>
 
       <label class="drop" id="drop">
-        <input id="files" type="file" accept="image/*" multiple />
-        <strong>Choose images</strong> <span class="muted">or drop them here</span>
+        <input id="files" type="file" accept="image/*,video/*" multiple />
+        <strong>Choose images or videos</strong> <span class="muted">or drop them here</span>
       </label>
       <ul id="images"></ul>
 
@@ -49,7 +52,7 @@
           <a id="download" class="button" download="targets.bin">Download targets.bin</a>
           <a id="try" class="button secondary" target="_blank" rel="noopener">Try it in the demo</a>
         </div>
-        <p class="muted">Orange circles are detection features, teal squares are tracking points. Both should cover the image evenly.</p>
+        <p class="muted">Orange circles are detection features, teal squares are tracking points (for videos: on the first frame). Both should cover the image evenly.</p>
         <div id="targets"></div>
       </section>
     </main>

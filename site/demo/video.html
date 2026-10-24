@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Video demo – fastar</title>
+    <link rel="stylesheet" href="../style.css" />
+    <style>
+      #clip { width: 100%; display: block; border-radius: 6px; border: 1px solid var(--border); background: #000; }
+      #ar { display: none; }
+      body.running { background: #000; overflow: hidden; }
+      body.running header, body.running main { display: none; }
+      body.running #ar { display: block; }
+      #video, #gl { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      #stop { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: 12px; }
+      #status { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); color: #fff; font: 13px system-ui, sans-serif; text-shadow: 0 0 3px #000; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <header>
+      <a href="https://github.com/jveski/fastar">fastar</a>
+      <a href="../compile.html">Compiler</a>
+      <a href="./">Demo</a>
+      <a href="video.html" aria-current="page">Video demo</a>
+    </header>
+    <main>
+      <h1>Video demo</h1>
+      <p class="muted">
+        A cube on a video that never holds still. The whole picture churns, swirls and changes colour all the time,
+        and nothing is sent between the two devices: the camera alone finds the screen and the moment the clip is at.
+        Play the clip full screen on another device (double-click it), then tap Start on your phone and point it at the screen.
+        Once the time is locked, the cube turns with the swirl beneath it, grows and shrinks with it, and changes colour with the clip.
+      </p>
+      <div class="row">
+        <button id="start" disabled>Start</button>
+        <span id="error" class="warn"></span>
+      </div>
+      <video id="clip" autoplay loop muted playsinline></video>
+      <p class="muted">
+        <a href="https://github.com/jveski/fastar/blob/main/site/demo/video.html">View this page's source</a>
+        for a complete example.
+      </p>
+    </main>
+
+    <div id="ar">
+      <video id="video" muted playsinline></video>
+      <canvas id="gl"></canvas>
+      <button id="stop" class="secondary">Stop</button>
+      <div id="status"></div>
+    </div>
+
+    <script type="module">
+      import * as THREE from 'three';
+
+      const $ = (id) => document.getElementById(id);
+      // The built site (dist/site) has the library and the clip's files next to this page;
+      // served from the repository root (site/demo/video.html), they come from dist/ and examples/.
+      const fromSource = /\/site\/demo\//.test(location.pathname);
+      const at = (path) => new URL(path, location.href).href;
+      const lib = at(fromSource ? '../../dist/fastar.js' : '../fastar.js');
+      const assets = fromSource ? '../../examples/video/' : 'video/';
+      const [{ ImageTracker, ThreeAdapter }, { createOverlay }] = await Promise.all([import(lib), import(at(assets + 'overlay.js'))]).catch((err) => {
+        $('error').textContent = fromSource
+          ? `Could not load ${lib} (run npm run build first): ${err.message}`
+          : `Could not load the demo: ${err.message}`;
+        throw err;
+      });
+      $('clip').src = at(assets + 'clip.mp4');
+      $('clip').ondblclick = () => $('clip').requestFullscreen?.();
+
+      const canvas = $('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+
+      const [ar, sceneInfo] = await Promise.all([
+        ImageTracker.create({ targets: at(assets + 'targets.bin') }),
+        fetch(at(assets + 'scene.json')).then((r) => r.json()),
+      ]).catch((err) => {
+        $('error').textContent = `Could not load the targets: ${err.message}`;
+        throw err;
+      });
+      // The cube, kept in step with the clip by the video time recovered from the camera.
+      const overlay = createOverlay(THREE, ar.targets[0], sceneInfo);
+      scene.add(overlay.root);
+
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        render: (e) => {
+          // videoTime: where the clip is in this camera frame (seconds).
+          const p = e.poses.get(0);
+          overlay.update(p?.videoTimeLocked ? p.videoTime : null);
+          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          renderer.render(scene, camera);
+        },
+      });
+      three.anchor(0, overlay.root);
+
+      let timer = 0;
+      $('start').disabled = false;
+      $('start').onclick = async () => {
+        $('error').textContent = '';
+        document.body.classList.add('running');
+        $('clip').pause();
+        try {
+          await ar.start({ video: $('video'), requestMotionPermission: true, syncDisplay: true });
+        } catch (err) {
+          document.body.classList.remove('running');
+          $('error').textContent = err.message;
+          throw err;
+        }
+        timer = setInterval(() => {
+          const s = ar.stats;
+          const vt = ar.videoTimeAt(0, performance.now());
+          const tracking = s.targets.length > 0;
+          const clock = vt && tracking ? ` · video at ${vt.time.toFixed(1)} s${vt.locked ? '' : ' (locking…)'}` : '';
+          $('status').textContent = (tracking ? 'Tracking' : 'Looking for the video…') + clock;
+        }, 250);
+      };
+
+      $('stop').onclick = () => {
+        ar.stop();
+        clearInterval(timer);
+        $('status').textContent = '';
+        document.body.classList.remove('running');
+        $('clip').play();
+      };
+    </script>
+  </body>
+</html>

@@ -3,9 +3,10 @@ import { mathCases } from './cases/math';
 import { visionCases } from './cases/vision';
 import { acquireCases } from './cases/acquire';
 import { trackingCases } from './cases/tracking';
+import { videoCases } from './cases/video';
 
 const filter = process.argv[2];
-const all: BenchCase[] = [...mathCases(), ...visionCases(), ...acquireCases(), ...trackingCases()];
+const all: BenchCase[] = [...mathCases(), ...visionCases(), ...acquireCases(), ...trackingCases(), ...videoCases()];
 const cases = all.filter((c) => !filter || c.name.includes(filter));
 
 const results = [];

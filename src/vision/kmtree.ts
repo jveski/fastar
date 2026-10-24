@@ -119,11 +119,14 @@ export class KmTreeSearcher {
 
   /**
    * kp = [x, y, scale, angle] per target feature; second-best candidates
-   * within `dupRadius` base pixels of the best are ignored for the ratio test.
+   * within `dupRadius` base pixels of the best are ignored for the ratio test,
+   * and so are those for which `covisible(best, other)` is false (video
+   * targets: the same content seen at another time, somewhere else).
    */
   search(
     tree: Int32Array, tdesc: Uint32Array, kp: Float32Array,
     q: Uint32Array, qo: number, dupRadius = 6,
+    covisible?: (a: number, b: number) => boolean,
   ): number {
     this.best1 = -1;
     this.dist1 = 257;
@@ -132,6 +135,10 @@ export class KmTreeSearcher {
     let checks = 0;
     let node = 0;
     const r2 = dupRadius * dupRadius;
+    const rival = (f: number, b: number): boolean => {
+      const dx = kp[4 * f] - kp[4 * b], dy = kp[4 * f + 1] - kp[4 * b + 1];
+      return dx * dx + dy * dy > r2 && (!covisible || covisible(f, b));
+    };
     for (;;) {
       // Descend greedily, pushing siblings into the heap.
       while (tree[node] > 0) {
@@ -157,15 +164,11 @@ export class KmTreeSearcher {
         const dd = hamming(tdesc, 8 * f, q, qo);
         checks++;
         if (dd < this.dist1) {
-          if (this.best1 >= 0) {
-            const dx = kp[4 * f] - kp[4 * this.best1], dy = kp[4 * f + 1] - kp[4 * this.best1 + 1];
-            if (dx * dx + dy * dy > r2) this.dist2 = this.dist1;
-          }
+          if (this.best1 >= 0 && rival(f, this.best1)) this.dist2 = this.dist1;
           this.dist1 = dd;
           this.best1 = f;
-        } else if (dd < this.dist2) {
-          const dx = kp[4 * f] - kp[4 * this.best1], dy = kp[4 * f + 1] - kp[4 * this.best1 + 1];
-          if (dx * dx + dy * dy > r2) this.dist2 = dd;
+        } else if (dd < this.dist2 && rival(f, this.best1)) {
+          this.dist2 = dd;
         }
       }
       if (checks >= this.maxChecks || this.heapSize === 0) break;
