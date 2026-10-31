@@ -30,6 +30,10 @@ The camera project and the `forceCopyPath` / no-WebGL tests are Chromium-only.
 Firefox's Playwright build may fail to launch inside sandboxed local shells;
 CI is the source of truth for Firefox.
 
+The GitHub workflow only runs nightly and from **Run workflow**; it has no
+pull-request trigger. GitHub only exposes that manual button after the workflow
+exists on the repository's default branch.
+
 ## What is covered
 
 - **Replay** of deterministic rendered scenes (`static`, `sweep`, `occlusion`,
@@ -43,7 +47,7 @@ CI is the source of truth for Firefox.
   then replay the produced session in the same page.
 - **Mobile emulation**: Pixel 8 Chrome and iPhone 15 Safari viewports,
   including a mid-run orientation/viewport change.
-- **Android emulator** Chrome (Playwright `_android`) and **iOS Simulator**
+- **Android emulator** Chrome (Appium/UiAutomator2) and **iOS Simulator**
   Mobile Safari (Appium/XCUITest). Both are CI-only; see `runners/`.
 - **Real-device golden sessions** in `fixtures/golden/` (skipped until a
   recording from a physical phone is added).

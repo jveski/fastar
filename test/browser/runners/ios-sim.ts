@@ -9,7 +9,7 @@ import { strict as assert } from 'node:assert';
 import { BASE, checkReplay, checkVideo, closeServer, startServer, waitForServer } from './shared';
 import { createSession, deleteSession, navigateAndRun, waitAppium } from './appium';
 
-function pickSimulator(): string {
+function pickSimulator(): { udid: string; version: string } {
   const out = execFileSync('xcrun', ['simctl', 'list', 'devices', 'available', '-j'], { encoding: 'utf8' });
   const data = JSON.parse(out) as { devices: Record<string, Array<{ udid: string; name: string; state: string }>> };
   const runtimes = Object.keys(data.devices)
@@ -21,8 +21,10 @@ function pickSimulator(): string {
     if (phone) {
       try { execFileSync('xcrun', ['simctl', 'boot', phone.udid], { stdio: 'ignore' }); } catch { /* already booted */ }
       execFileSync('xcrun', ['simctl', 'bootstatus', phone.udid, '-b'], { stdio: 'inherit' });
+      const match = runtime.match(/iOS-(\d+)-(\d+)/);
+      const version = match ? `${match[1]}.${match[2]}` : '26.0';
       console.log(`iOS simulator: ${phone.name} (${runtime}) ${phone.udid}`);
-      return phone.udid;
+      return { udid: phone.udid, version };
     }
   }
   throw new Error('no available iPhone simulator runtime; install one in Xcode');
@@ -34,13 +36,15 @@ let sessionId: string | null = null;
 try {
   await waitForServer();
   await waitAppium();
-  const udid = pickSimulator();
+  const sim = pickSimulator();
 
   sessionId = await createSession({
     platformName: 'iOS',
     browserName: 'Safari',
     'appium:automationName': 'XCUITest',
-    'appium:udid': udid,
+    'appium:udid': sim.udid,
+    'appium:platformVersion': sim.version,
+    'appium:isHeadless': true,
     'appium:autoAcceptAlerts': true,
     'appium:newCommandTimeout': 300,
     'appium:simulatorStartupTimeout': 300_000,

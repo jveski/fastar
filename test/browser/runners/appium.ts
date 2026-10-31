@@ -1,18 +1,46 @@
 // Minimal W3C WebDriver client for the Appium jobs. Keeping this small avoids
 // pulling webdriverio into the project just for two CI-only runners.
+//
+// Node's fetch has a fixed 5-minute headers timeout, and WDA builds routinely
+// exceed that. Use node:http so session creation can take 20 minutes.
 import { strict as assert } from 'node:assert';
+import { request } from 'node:http';
 
 export const APPIUM = process.env.APPIUM_URL ?? 'http://127.0.0.1:4723';
 
-export async function wd(method: string, path: string, body?: unknown): Promise<any> {
-  const res = await fetch(`${APPIUM}${path}`, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
+export function wd(method: string, path: string, body?: unknown): Promise<any> {
+  const url = new URL(`${APPIUM}${path}`);
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = request({
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method,
+      timeout: 20 * 60_000,
+      headers: payload
+        ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }
+        : {},
+    }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        let json: any = {};
+        try { json = JSON.parse(data); } catch { /* non-JSON error page */ }
+        const code = res.statusCode ?? 0;
+        if (code < 200 || code >= 300) {
+          reject(new Error(`${method} ${path}: HTTP ${code} ${JSON.stringify(json).slice(0, 1200)}`));
+        } else {
+          resolve(json.value);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error(`${method} ${path}: timed out`)));
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`${method} ${path}: HTTP ${res.status} ${JSON.stringify(json).slice(0, 1200)}`);
-  return json.value;
 }
 
 export async function waitAppium(): Promise<void> {

@@ -86,7 +86,9 @@ jobs:
 
       - name: Start Appium
         run: |
-          appium --port 4723 --log-level info > appium.log 2>&1 &
+          appium --port 4723 --log-level info \
+            --allow-insecure uiautomator2:chromedriver_autodownload \
+            > appium.log 2>&1 &
           for i in {1..60}; do
             if curl -sf http://127.0.0.1:4723/status >/dev/null; then exit 0; fi
             sleep 2
@@ -144,6 +146,13 @@ jobs:
         run: |
           npm run build
           node test/browser/build.mjs
+
+      - name: Select newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          latest=$(ls -d /Applications/Xcode*.app | sort | tail -1)
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
 
       - name: Install Appium and XCUITest driver
         run: |
