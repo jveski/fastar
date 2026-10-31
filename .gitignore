@@ -3,3 +3,6 @@ dist/
 coverage/
 *.log
 .DS_Store
+test/browser/public/
+test-results/
+playwright-report/
