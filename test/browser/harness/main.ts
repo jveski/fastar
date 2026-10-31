@@ -43,6 +43,7 @@ const useTruth = p.get('truth') !== '0';
 const result: HarnessResult = {
   done: false, error: null, mode, scenario, startedAt: 0, endedAt: 0,
   frames: [], events: { found: [], lost: [] }, stats: null,
+  logs: [], probe: null,
   diagnostics: {
     userAgent: navigator.userAgent,
     devicePixelRatio: devicePixelRatio || 1,
@@ -57,6 +58,18 @@ const result: HarnessResult = {
   replay: null,
 };
 window.__fastarTest = result;
+
+// Worker failures only reach console.error, so keep them in the result.
+for (const level of ['error', 'warn'] as const) {
+  const orig = console[level].bind(console);
+  console[level] = (...args: unknown[]) => {
+    result.logs.push(`${level}: ${args.map((a) => String(a)).join(' ')}`.slice(0, 1000));
+    if (result.logs.length > 50) result.logs.shift();
+    orig(...args);
+  };
+}
+window.addEventListener('error', (e) => result.logs.push(`window error: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => result.logs.push(`rejection: ${String(e.reason)}`));
 
 function log(msg: string): void {
   status.textContent = msg;
@@ -77,6 +90,34 @@ function noteSizes(ar: ImageTracker): void {
   const p = ar.processingSize;
   result.diagnostics.processing = [p.width, p.height];
   result.diagnostics.videoSize = [targetVideo.videoWidth, targetVideo.videoHeight];
+}
+
+/** Sample the displayed video at the end: a black image means decode/GPU trouble. */
+function probeVideo(): void {
+  const c = document.createElement('canvas');
+  c.width = 64;
+  c.height = 48;
+  let meanLuma = -1;
+  let error: string | null = null;
+  try {
+    const ctx = c.getContext('2d')!;
+    ctx.drawImage(targetVideo, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    meanLuma = sum / (c.width * c.height);
+  } catch (e) {
+    error = String((e as Error)?.message ?? e);
+  }
+  result.probe = {
+    videoTime: targetVideo.currentTime,
+    paused: targetVideo.paused,
+    readyState: targetVideo.readyState,
+    videoWidth: targetVideo.videoWidth,
+    videoHeight: targetVideo.videoHeight,
+    meanLuma,
+    error,
+  };
 }
 
 function snapshot(ar: ImageTracker): StatsSample {
@@ -201,6 +242,7 @@ async function startReplay(log: SessionLog, ms: number): Promise<void> {
   });
   noteSizes(ar);
   await sleep(ms);
+  probeVideo();
   result.frames = frames;
   result.events = events;
   result.stats = snapshot(ar);
@@ -234,6 +276,7 @@ async function startLive(): Promise<void> {
   const ms = runOverride || (truth ? (mode === 'camera' ? truth.duration * 1000 : truth.duration * 1000 + 500) : 4000);
   await sleep(ms);
   clearImu();
+  probeVideo();
   result.frames = frames;
   result.events = events;
   result.stats = snapshot(ar);

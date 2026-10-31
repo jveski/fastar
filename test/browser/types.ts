@@ -56,6 +56,18 @@ export interface HarnessResult {
   events: { found: number[]; lost: number[] };
   stats: StatsSample | null;
   diagnostics: Diagnostics;
+  /** Console errors/warnings, which is where worker failures surface. */
+  logs: string[];
+  /** A sampled video frame at the end of the run, for black-frame debugging. */
+  probe: {
+    videoTime: number;
+    paused: boolean;
+    readyState: number;
+    videoWidth: number;
+    videoHeight: number;
+    meanLuma: number;
+    error: string | null;
+  } | null;
   /** Present for mode=record: the result of replaying the recorded session. */
   replay: { frames: FrameSample[]; stats: StatsSample | null; error: string | null } | null;
 }
