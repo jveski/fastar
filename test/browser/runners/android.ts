@@ -41,15 +41,15 @@ try {
 
   // The emulator's WebGL2 video upload is not reliable with the old Chrome in
   // the Play image; exercise the 2D luma fallback instead.
-  const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep&no-webgl2=1`);
+  const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.5&runMs=8000`);
   dump('sweep', sweep);
   checkReplay('sweep', sweep, { p95: 8, minFrames: 8, settle: 3, minErrors: 3 });
 
-  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&no-webgl2=1`);
+  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.5&runMs=8000`);
   dump('video', video);
   checkVideo(video, { minFrames: 3, locked: 0.3 });
 
-  const stream = await navigateAndRun(sessionId, `${BASE}/?mode=stream&scenario=static&useImu=0&no-webgl2=1&runMs=6000`);
+  const stream = await navigateAndRun(sessionId, `${BASE}/?mode=stream&scenario=static&useImu=0&no-webgl2=1&no-offscreen=1&runMs=6000`);
   dump('stream', stream);
   if (stream.error) throw new Error(`stream: ${stream.error}`);
   if (stream.frames.length < 8) throw new Error(`stream: too few frames (${stream.frames.length})`);

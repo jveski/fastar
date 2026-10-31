@@ -34,11 +34,16 @@ const sync = p.get('sync') === '1';
 const forceCopy = p.get('copy') === '1';
 const noRvfc = p.get('norvfc') === '1';
 const noWebgl2 = p.get('no-webgl2') === '1';
+const noOffscreen = p.get('no-offscreen') === '1';
 const denyMotion = p.get('deny') === '1';
+const OffscreenCtor = (globalThis as { OffscreenCanvas?: typeof OffscreenCanvas }).OffscreenCanvas;
 const useImu = p.get('useImu') !== '0';
 const runOverride = Number(p.get('runMs') ?? 0);
 const targetFile = p.get('target') ?? 'targets-image.bin';
 const useTruth = p.get('truth') !== '0';
+// Slow devices can play the clip slower to give acquisition more wall time;
+// truth is keyed by mediaTime, so the comparison is unchanged.
+const playbackRate = Number(p.get('rate') ?? 1);
 
 const result: HarnessResult = {
   done: false, error: null, mode, scenario, startedAt: 0, endedAt: 0,
@@ -98,14 +103,21 @@ function probeVideo(): void {
   c.width = 64;
   c.height = 48;
   let meanLuma = -1;
+  let offscreenLuma = -1;
   let error: string | null = null;
-  try {
-    const ctx = c.getContext('2d')!;
-    ctx.drawImage(targetVideo, 0, 0, c.width, c.height);
-    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+  const mean = (ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D): number => {
+    ctx.drawImage(targetVideo, 0, 0, 64, 48);
+    const d = ctx.getImageData(0, 0, 64, 48).data;
     let sum = 0;
     for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    meanLuma = sum / (c.width * c.height);
+    return sum / (64 * 48);
+  };
+  try {
+    meanLuma = mean(c.getContext('2d')!);
+    if (OffscreenCtor) {
+      const off = new OffscreenCtor(64, 48);
+      offscreenLuma = mean(off.getContext('2d')!);
+    }
   } catch (e) {
     error = String((e as Error)?.message ?? e);
   }
@@ -116,6 +128,7 @@ function probeVideo(): void {
     videoWidth: targetVideo.videoWidth,
     videoHeight: targetVideo.videoHeight,
     meanLuma,
+    offscreenLuma,
     error,
   };
 }
@@ -124,7 +137,8 @@ function snapshot(ar: ImageTracker): StatsSample {
   const s = ar.stats;
   return {
     path: s.path, sensors: s.sensors, motionPermission: s.motionPermission,
-    imuSamples: s.imuSamples, fps: s.fps, latency: s.latency, td: s.td, tdCalibrated: s.tdCalibrated,
+    imuSamples: s.imuSamples, fps: s.fps, latency: s.latency,
+    trackerReady: s.trackerReady, acquireReady: s.acquireReady, td: s.td, tdCalibrated: s.tdCalibrated,
     targets: s.targets.map((t) => ({
       index: t.index, status: t.status, confidence: t.confidence, inliers: t.inliers, rms: t.rms,
     })),
@@ -240,6 +254,7 @@ async function startReplay(log: SessionLog, ms: number): Promise<void> {
     video: targetVideo, replay: { log, video: fixture(`${scenario}.mp4`) },
     syncDisplay: sync, forceCopyPath: forceCopy, useImu, hfov: HFOV,
   });
+  if (playbackRate > 0 && playbackRate !== 1) targetVideo.playbackRate = playbackRate;
   noteSizes(ar);
   await sleep(ms);
   probeVideo();
@@ -315,10 +330,29 @@ async function startRecord(): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
+async function workerSmokeTest(): Promise<string> {
+  try {
+    const url = URL.createObjectURL(new Blob(['self.onmessage = () => self.postMessage("ok")'], { type: 'text/javascript' }));
+    const w = new Worker(url);
+    const out = await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000);
+      w.onmessage = () => { clearTimeout(timer); resolve('ok'); };
+      w.onerror = (e) => { clearTimeout(timer); resolve(`error: ${e.message}`); };
+      w.postMessage(0);
+    });
+    w.terminate();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return out;
+  } catch (e) {
+    return `throw: ${String((e as Error)?.message ?? e)}`;
+  }
+}
+
 async function run(): Promise<void> {
   result.startedAt = performance.now();
   try {
     localStorage.clear();
+    result.diagnostics.worker = await workerSmokeTest();
     const truth = useTruth ? await fetchJson<Truth>(`${scenario}.truth.json`) : null;
     if (mode === 'record') {
       await startRecord();
@@ -339,6 +373,15 @@ async function run(): Promise<void> {
 // Environment patches must happen before fastar.js snapshots prototypes.
 if (noRvfc) {
   delete (HTMLVideoElement.prototype as unknown as Record<string, unknown>).requestVideoFrameCallback;
+}
+if (noOffscreen) {
+  // Chrome 113 on the Android emulator can return black from drawImage(video)
+  // on an OffscreenCanvas; use the HTMLCanvasElement path instead.
+  try {
+    Object.defineProperty(globalThis, 'OffscreenCanvas', { value: undefined, configurable: true });
+  } catch {
+    // Leave the native constructor in place if the global is not configurable.
+  }
 }
 if (noWebgl2) {
   const patch = (proto: { getContext: (id: string, ...a: unknown[]) => unknown }) => {

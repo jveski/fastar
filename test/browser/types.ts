@@ -26,6 +26,8 @@ export interface StatsSample {
   imuSamples: number;
   fps: number;
   latency: number;
+  trackerReady: boolean;
+  acquireReady: boolean;
   td: number;
   tdCalibrated: boolean;
   targets: Array<{ index: number; status: string; confidence: number; inliers: number; rms: number }>;
@@ -43,6 +45,7 @@ export interface Diagnostics {
   secureContext: boolean;
   processing?: [number, number];
   videoSize?: [number, number];
+  worker?: string;
 }
 
 export interface HarnessResult {
@@ -66,6 +69,7 @@ export interface HarnessResult {
     videoWidth: number;
     videoHeight: number;
     meanLuma: number;
+    offscreenLuma: number;
     error: string | null;
   } | null;
   /** Present for mode=record: the result of replaying the recorded session. */
