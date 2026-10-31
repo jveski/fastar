@@ -47,7 +47,10 @@ async function startSession(sim: { udid: string; version: string }): Promise<str
         'appium:udid': sim.udid,
         'appium:platformVersion': sim.version,
         'appium:autoAcceptAlerts': true,
-        'appium:noReset': true,
+        // Force a real tab: a freshly wiped simulator can sit on Safari's
+        // welcome screen, where the remote debugger has no web application.
+        'appium:safariInitialUrl': `${BASE}/`,
+        'appium:webviewConnectTimeout': 60_000,
         'appium:newCommandTimeout': 300,
         'appium:simulatorStartupTimeout': 600_000,
         'appium:wdaLaunchTimeout': 600_000,
@@ -58,9 +61,9 @@ async function startSession(sim: { udid: string; version: string }): Promise<str
       const message = (e as Error).message;
       console.log(`iOS session attempt ${attempt} failed: ${message.slice(0, 500)}`);
       if (attempt === 2) throw e;
-      // The hosted runner occasionally hands Appium a simulator that never
-      // reaches SpringBoard. Wipe and boot it once before trying again.
-      bootSimulator(sim.udid, true);
+      // A corrupt boot needs a wipe; a Safari/remote-debugger miss only needs
+      // a restart (erasing would put Safari back on its welcome screen).
+      bootSimulator(sim.udid, /did not finish booting/i.test(message));
     }
   }
   throw new Error('unreachable');
