@@ -4,10 +4,10 @@ import { expectNoErrors } from '../metrics';
 test.describe('mobile layout', () => {
   test('keeps tracking across a viewport/orientation change', async ({ page }, testInfo) => {
     test.skip(!testInfo.project.name.startsWith('mobile'), 'touch/orientation emulation projects');
-    await page.goto('/?mode=stream&scenario=static&useImu=0&runMs=6000');
+    await page.goto('/?mode=replay&scenario=sweep&useImu=0&runMs=3000');
     await page.waitForFunction(() => typeof window.__fastarTest !== 'undefined' && !window.__fastarTest.done);
     await page.locator('#start').tap();
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
     await page.setViewportSize({ width: 820, height: 420 });
     await page.waitForFunction(() => window.__fastarTest.done, undefined, { timeout: 30_000 });
     const r = await page.evaluate(() => window.__fastarTest);

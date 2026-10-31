@@ -1,8 +1,14 @@
 import { expect, test } from '@playwright/test';
 import { expectNoErrors, runHarness, visibleRatio } from '../metrics';
 
+function webkitLinux(testInfo: import('@playwright/test').TestInfo): boolean {
+  const name = testInfo.project.name;
+  return process.platform === 'linux' && (name.includes('webkit') || name.includes('safari'));
+}
+
 test.describe('motion sensors', () => {
-  test('feeds synthetic devicemotion into the tracker', async ({ page }) => {
+  test('feeds synthetic devicemotion into the tracker', async ({ page }, testInfo) => {
+    test.skip(webkitLinux(testInfo), 'WebKitGTK does not deliver canvas capture frames');
     const r = await runHarness(page, { mode: 'sensors', scenario: 'sweep' });
     test.skip(!r.diagnostics.deviceMotionEvent, 'DeviceMotionEvent is not available in this browser');
     expectNoErrors(r);

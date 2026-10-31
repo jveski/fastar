@@ -1,46 +1,48 @@
-// Android Chrome on an emulator, driven through Playwright's Android support.
-// The workflow runs an emulator, sets `adb reverse tcp:4173 tcp:4173`, then
-// executes: npx tsx test/browser/runners/android.ts
-import { _android as android } from '@playwright/test';
+// Android Chrome on an emulator, driven through Appium/UiAutomator2. Playwright's
+// `_android` driver relies on Chrome's command-line file, which stock Google
+// Play images ignore, so Appium's Chromedriver path is the reliable option.
+//
+// The workflow boots the emulator, sets `adb reverse tcp:4173 tcp:4173`, starts
+// Appium, then executes: npx tsx test/browser/runners/android.ts
 import { BASE, checkReplay, checkVideo, closeServer, startServer, waitForServer } from './shared';
-import { runHarness } from '../metrics';
-
-type AndroidDevice = Awaited<ReturnType<typeof android.devices>>[number];
-type AndroidContext = Awaited<ReturnType<AndroidDevice['launchBrowser']>>;
+import { createSession, deleteSession, navigateAndRun, waitAppium } from './appium';
 
 const server = startServer();
-let device: AndroidDevice | null = null;
-let context: AndroidContext | null = null;
+let sessionId: string | null = null;
 
 try {
   await waitForServer();
-  const [d] = await android.devices();
-  if (!d) throw new Error('no Android device: check adb devices and KVM');
-  device = d;
-  console.log(`Android device: ${d.model()} (${d.serial()})`);
+  await waitAppium();
 
-  // No Chrome command-line flags here: this is the baseline path that works
-  // on stock, non-rooted Android. The app is served over adb reverse.
-  context = await d.launchBrowser({ baseURL: BASE });
-  const page = await context.newPage();
-  page.setDefaultTimeout(60_000);
+  sessionId = await createSession({
+    platformName: 'Android',
+    browserName: 'Chrome',
+    'appium:automationName': 'UiAutomator2',
+    'appium:deviceName': 'Android Emulator',
+    'appium:platformVersion': '14',
+    'appium:autoGrantPermissions': true,
+    'appium:chromedriverAutodownload': true,
+    'appium:newCommandTimeout': 300,
+    'appium:uiautomator2ServerLaunchTimeout': 120_000,
+    'appium:chromeOptions': {
+      args: ['--no-first-run', '--disable-fre', '--no-default-browser-check'],
+    },
+  });
+  console.log('Android Appium session started');
 
-  const sweep = await runHarness(page, { mode: 'replay', scenario: 'sweep' });
+  const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep`);
   checkReplay('sweep', sweep, { p95: 6 });
 
-  const video = await runHarness(page, { mode: 'replay', scenario: 'video', target: 'targets-video.bin' });
+  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin`);
   checkVideo(video);
 
-  const stream = await runHarness(page, { mode: 'stream', scenario: 'static', useImu: '0' });
+  const stream = await navigateAndRun(sessionId, `${BASE}/?mode=stream&scenario=static&useImu=0`);
   if (stream.error) throw new Error(`stream: ${stream.error}`);
   if (stream.frames.length < 20) throw new Error(`stream: too few frames (${stream.frames.length})`);
   console.log(`stream: ${stream.frames.length} frames, ${stream.stats?.path}`);
 
-  await context.close();
-  context = null;
   console.log('android browser suite passed');
 } finally {
-  await context?.close().catch(() => {});
-  await device?.close().catch(() => {});
+  if (sessionId) await deleteSession(sessionId);
   await closeServer(server);
 }

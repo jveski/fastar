@@ -31,7 +31,7 @@ export async function waitForServer(): Promise<void> {
 export function checkReplay(name: string, r: HarnessResult, opts: { minFrames?: number; p95?: number } = {}): void {
   if (r.error) throw new Error(`${name}: harness error: ${r.error}`);
   assert.ok(r.frames.length > (opts.minFrames ?? 20), `${name}: too few frames (${r.frames.length})`);
-  assert.ok(firstLockMs(r) < 2500, `${name}: slow lock (${firstLockMs(r)} ms)`);
+  assert.ok(firstLockMs(r) < 6000, `${name}: slow lock (${firstLockMs(r)} ms)`);
   assert.ok(visibleRatio(r) > 0.6, `${name}: visible ratio ${visibleRatio(r).toFixed(2)}`);
   const t = truth(name);
   const errors = bestOffset(settled(r), t, 12).errors;

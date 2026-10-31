@@ -11,10 +11,10 @@ export function truth(name: string): Truth {
   return JSON.parse(readFileSync(join(FIXTURES, `${name}.truth.json`), 'utf8')) as Truth;
 }
 
-export async function runHarness(page: Page, params: Record<string, string | number | boolean>): Promise<HarnessResult> {
+export async function runHarness(page: Page, params: Record<string, string | number | boolean>, base = ''): Promise<HarnessResult> {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) q.set(k, String(v));
-  await page.goto(`/?${q.toString()}`);
+  await page.goto(`${base}/?${q.toString()}`);
   await page.waitForFunction(() => typeof window.__fastarTest !== 'undefined' && !window.__fastarTest.done);
   await page.locator('#start').click();
   await page.waitForFunction(() => window.__fastarTest.done, undefined, { timeout: 75_000 });
