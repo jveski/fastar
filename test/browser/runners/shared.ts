@@ -28,18 +28,32 @@ export async function waitForServer(): Promise<void> {
   throw new Error('static server did not start');
 }
 
-export function checkReplay(
+/**
+ * Lock and continuity checks for a replay, without the overlay comparison.
+ * Useful on simulators whose rAF fallback stamps a frame with the video time a
+ * few display frames after the pixels it captured; motion overlay accuracy
+ * there measures the fallback, not the tracker.
+ */
+export function checkTracking(
   name: string,
   r: HarnessResult,
-  opts: { minFrames?: number; p95?: number; settle?: number; minErrors?: number } = {},
+  opts: { minFrames?: number; maxLockMs?: number } = {},
 ): void {
   if (r.error) throw new Error(`${name}: harness error: ${r.error}`);
   const posed = r.frames.filter((f) => f.poses.length).length;
   console.log(`${name}: error=${r.error} frames=${r.frames.length} posed=${posed} stats=${JSON.stringify(r.stats)}`);
   if (r.logs?.length) console.log(`${name}: logs=${JSON.stringify(r.logs.slice(0, 10))}`);
   assert.ok(r.frames.length > (opts.minFrames ?? 20), `${name}: too few frames (${r.frames.length})`);
-  assert.ok(firstLockMs(r) < 6000, `${name}: slow lock (${firstLockMs(r)} ms)`);
+  assert.ok(firstLockMs(r) < (opts.maxLockMs ?? 6000), `${name}: slow lock (${firstLockMs(r)} ms)`);
   assert.ok(visibleRatio(r) > 0.6, `${name}: visible ratio ${visibleRatio(r).toFixed(2)}`);
+}
+
+export function checkReplay(
+  name: string,
+  r: HarnessResult,
+  opts: { minFrames?: number; p95?: number; settle?: number; minErrors?: number; maxLockMs?: number } = {},
+): void {
+  checkTracking(name, r, opts);
   const t = truth(name);
   const errors = bestOffset(settled(r, opts.settle ?? 15), t, 12).errors;
   assert.ok(errors.length > (opts.minErrors ?? 10), `${name}: too few pose samples`);

@@ -6,7 +6,7 @@
 // an Appium server on :4723, and Xcode with an iOS runtime.
 import { execFileSync } from 'node:child_process';
 import { strict as assert } from 'node:assert';
-import { BASE, checkReplay, checkVideo, closeServer, startServer, waitForServer } from './shared';
+import { BASE, checkReplay, checkTracking, checkVideo, closeServer, startServer, waitForServer } from './shared';
 import { createSession, deleteSession, navigateAndRun, waitAppium } from './appium';
 
 function pickSimulator(): { udid: string; name: string; version: string } {
@@ -93,7 +93,15 @@ try {
   // clips at half speed: acquisition gets more wall time while mediaTime (and
   // therefore the ground truth) stays in sync.
   const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep&useImu=0&norvfc=1&rate=0.5&runMs=8000`);
-  checkReplay('sweep', sweep, { p95: 8, minFrames: 8, settle: 2, minErrors: 2 });
+  checkTracking('sweep', sweep, { minFrames: 8 });
+
+  // The rAF fallback stamps a frame with the video time a display frame or two
+  // after the pixels it grabbed. At ~3 fps on a moving clip that is a large
+  // overlay error even though the tracker is correct, so use the static scene
+  // for the overlay gate (as on Android). Desktop and Playwright's mobile
+  // WebKit still assert overlay accuracy through the sweep.
+  const still = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=static&useImu=0&norvfc=1&rate=0.5&runMs=8000`);
+  checkReplay('static', still, { p95: 8, minFrames: 8, settle: 2, minErrors: 2 });
 
   const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&useImu=0&norvfc=1&rate=0.5&runMs=6000`);
   console.log(`video: ${video.frames.length} frames, ${JSON.stringify(video.stats)}`);
