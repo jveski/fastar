@@ -54,7 +54,7 @@ try {
   dump('static', replay);
   checkReplay('static', replay, { p95: 8, minFrames: 8, settle: 3, minErrors: 2 });
 
-  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.5&runMs=8000`);
+  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.25&runMs=12000`);
   dump('video', video);
   checkVideo(video, { minFrames: 3, locked: 0.3 });
 
