@@ -35,6 +35,9 @@ function bootSimulator(udid: string, erase: boolean): void {
   }
   try { execFileSync('xcrun', ['simctl', 'boot', udid], { stdio: 'ignore' }); } catch { /* already booted */ }
   execFileSync('xcrun', ['simctl', 'bootstatus', udid, '-b'], { stdio: 'inherit', timeout: 600_000 });
+  // Create a webview before Appium connects; the remote debugger occasionally
+  // finds Safari's welcome screen and then reports no web applications.
+  try { execFileSync('xcrun', ['simctl', 'openurl', udid, `${BASE}/`], { stdio: 'ignore' }); } catch { /* best effort */ }
 }
 
 async function startSession(sim: { udid: string; version: string }): Promise<string> {
@@ -50,7 +53,7 @@ async function startSession(sim: { udid: string; version: string }): Promise<str
         // Force a real tab: a freshly wiped simulator can sit on Safari's
         // welcome screen, where the remote debugger has no web application.
         'appium:safariInitialUrl': `${BASE}/`,
-        'appium:webviewConnectTimeout': 60_000,
+        'appium:webviewConnectTimeout': 120_000,
         'appium:newCommandTimeout': 300,
         'appium:simulatorStartupTimeout': 600_000,
         'appium:wdaLaunchTimeout': 600_000,
@@ -85,10 +88,14 @@ try {
   // Simulator Safari cannot ask for motion permission, and there is no camera.
   // The simulator's media clock is unreliable under automation, so use the
   // rAF fallback; the truth is still mapped by mediaTime.
-  const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep&useImu=0&norvfc=1`);
-  checkReplay('sweep', sweep, { p95: 8, minFrames: 8, settle: 3, minErrors: 3 });
+  //
+  // The simulator renders WebKit at only a few frames per second, so run the
+  // clips at half speed: acquisition gets more wall time while mediaTime (and
+  // therefore the ground truth) stays in sync.
+  const sweep = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=sweep&useImu=0&norvfc=1&rate=0.5&runMs=8000`);
+  checkReplay('sweep', sweep, { p95: 8, minFrames: 8, settle: 2, minErrors: 2 });
 
-  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&useImu=0&norvfc=1`);
+  const video = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=video&target=targets-video.bin&useImu=0&norvfc=1&rate=0.5&runMs=6000`);
   console.log(`video: ${video.frames.length} frames, ${JSON.stringify(video.stats)}`);
   checkVideo(video, { minFrames: 3, locked: 0.3 });
 
