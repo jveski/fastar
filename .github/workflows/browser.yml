@@ -1,6 +1,8 @@
 name: Browser tests
 
 on:
+  push:
+    branches: [browser-e2e]
   schedule:
     # Nightly, after the fast unit suite has had a chance to run.
     - cron: "17 6 * * *"
