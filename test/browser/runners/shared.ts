@@ -28,26 +28,30 @@ export async function waitForServer(): Promise<void> {
   throw new Error('static server did not start');
 }
 
-export function checkReplay(name: string, r: HarnessResult, opts: { minFrames?: number; p95?: number } = {}): void {
+export function checkReplay(
+  name: string,
+  r: HarnessResult,
+  opts: { minFrames?: number; p95?: number; settle?: number; minErrors?: number } = {},
+): void {
   if (r.error) throw new Error(`${name}: harness error: ${r.error}`);
   assert.ok(r.frames.length > (opts.minFrames ?? 20), `${name}: too few frames (${r.frames.length})`);
   assert.ok(firstLockMs(r) < 6000, `${name}: slow lock (${firstLockMs(r)} ms)`);
   assert.ok(visibleRatio(r) > 0.6, `${name}: visible ratio ${visibleRatio(r).toFixed(2)}`);
   const t = truth(name);
-  const errors = bestOffset(settled(r), t, 12).errors;
-  assert.ok(errors.length > 10, `${name}: too few pose samples`);
+  const errors = bestOffset(settled(r, opts.settle ?? 15), t, 12).errors;
+  assert.ok(errors.length > (opts.minErrors ?? 10), `${name}: too few pose samples`);
   const p95 = percentile(errors, 0.95);
   assert.ok(p95 < (opts.p95 ?? 5), `${name}: overlay p95 ${p95.toFixed(2)} px`);
   console.log(`${name}: ${r.frames.length} frames, ${r.stats?.path}, lock ${firstLockMs(r).toFixed(0)} ms, p95 ${p95.toFixed(2)} px`);
 }
 
-export function checkVideo(r: HarnessResult): void {
+export function checkVideo(r: HarnessResult, opts: { minFrames?: number; locked?: number } = {}): void {
   if (r.error) throw new Error(`video: harness error: ${r.error}`);
-  assert.ok(r.frames.length > 20, 'video: too few frames');
+  assert.ok(r.frames.length > (opts.minFrames ?? 20), `video: too few frames`);
   assert.ok(visibleRatio(r) > 0.7, `video: visible ratio ${visibleRatio(r).toFixed(2)}`);
   const poses = r.frames.flatMap((f) => f.poses);
   const locked = poses.filter((p) => p.locked).length / Math.max(1, poses.length);
-  assert.ok(locked > 0.5, `video: clock locked ratio ${locked.toFixed(2)}`);
+  assert.ok(locked > (opts.locked ?? 0.5), `video: clock locked ratio ${locked.toFixed(2)}`);
   console.log(`video: ${r.frames.length} frames, clock locked ${(locked * 100).toFixed(0)}%`);
 }
 

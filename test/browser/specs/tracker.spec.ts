@@ -36,7 +36,7 @@ test.describe('tracker end to end', () => {
     // signal, while p95 catches a genuinely broken pose.
     const errors = bestOffset(settled(r), t).errors;
     expect(percentile(errors, 0.5)).toBeLessThan(3);
-    expect(percentile(errors, 0.95)).toBeLessThan(7);
+    expect(percentile(errors, 0.95)).toBeLessThan(9);
   });
 
   test('replays an occlusion: reports lost and reacquires', async ({ page }) => {

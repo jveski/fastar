@@ -150,7 +150,7 @@ jobs:
       - name: Select newest Xcode
         run: |
           ls -d /Applications/Xcode*.app
-          latest=$(ls -d /Applications/Xcode*.app | sort | tail -1)
+          latest=$(ls -d /Applications/Xcode_*.app | sort | tail -1)
           sudo xcode-select -s "$latest/Contents/Developer"
           xcodebuild -version
 
