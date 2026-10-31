@@ -12,7 +12,12 @@ let tracker: TrackerCore | null = null;
 self.onmessage = (e: MessageEvent) => {
   const m = e.data as ToTracker | AcquireInit;
   if (m.type === 'init-acquire') {
-    new AcquireCore().init(m);
+    try {
+      new AcquireCore().init(m);
+      self.postMessage({ type: 'acquire-ready' });
+    } catch (e) {
+      self.postMessage({ type: 'acquire-error', message: (e as Error).message ?? String(e) });
+    }
     return;
   }
   tracker ??= new TrackerCore((msg, transfer) => self.postMessage(msg, transfer ?? []));

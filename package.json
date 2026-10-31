@@ -46,11 +46,16 @@
     "check": "npm run typecheck && npm test && npm run build",
     "sim": "tsx scripts/sim.ts",
     "replay": "tsx scripts/replay.ts",
+    "fixtures:browser": "tsx test/browser/fixtures/generate.ts",
+    "test:browser": "npm run build && node test/browser/build.mjs && playwright test",
+    "test:browser:android": "tsx test/browser/runners/android.ts",
+    "test:browser:ios": "tsx test/browser/runners/ios-sim.ts",
     "compile": "tsx cli/compile.ts",
     "example:target": "tsx scripts/example-target.ts",
     "prepublishOnly": "npm run check"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@types/node": "^26.6.5",
     "esbuild": "^0.28.2",
     "jpeg-js": "^0.4.4",

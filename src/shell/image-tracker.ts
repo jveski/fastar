@@ -127,6 +127,9 @@ export interface TrackerStats {
   /** Capture to result latency (ms). */
   latency: number;
   timings: ResultMessage['timings'] | null;
+  /** Both workers finished their init handshake. */
+  trackerReady: boolean;
+  acquireReady: boolean;
   td: number;
   tdCalibrated: boolean;
   targets: FrameTargetInfo[];
@@ -150,7 +153,8 @@ export class ImageTracker {
   readonly targets: TargetMeta[];
   intrinsics: Intrinsics | null = null;
   readonly stats: TrackerStats = {
-    path: 'none', sensors: 'none', motionPermission: 'not-requested', imuSamples: 0, fps: 0, latency: 0, timings: null, td: 0, tdCalibrated: false, targets: [],
+    path: 'none', sensors: 'none', motionPermission: 'not-requested', imuSamples: 0, fps: 0, latency: 0, timings: null,
+    trackerReady: false, acquireReady: false, td: 0, tdCalibrated: false, targets: [],
   };
   readonly recorder: Recorder;
   /** Called with every worker result (benchmark / debugging). */
@@ -381,6 +385,14 @@ export class ImageTracker {
     this.acquirer = make();
     const ch = new MessageChannel();
     const K = this.intrinsics!;
+    // Worker errors are otherwise invisible: the tracker recovers, but no
+    // acquisition ever completes and the UI simply never locks.
+    this.acquirer.onerror = (e) => console.error('fastar acquire worker error', e.message);
+    this.acquirer.onmessage = (e) => {
+      const m = e.data as { type?: string; message?: string };
+      if (m?.type === 'acquire-ready') this.stats.acquireReady = true;
+      else if (m?.type === 'acquire-error') console.error('fastar acquire worker error', m.message);
+    };
     const acqInit: AcquireInit = { type: 'init-acquire', targets: this.buffer.slice(0), width, height, K, port: ch.port2 };
     this.acquirer.postMessage(acqInit, [acqInit.targets, ch.port2]);
     // Replays calibrate from scratch: stored values belong to this device, not the recording's.
@@ -419,6 +431,9 @@ export class ImageTracker {
 
   private onWorker(m: FromTracker): void {
     switch (m.type) {
+      case 'ready':
+        this.stats.trackerReady = true;
+        return;
       case 'result': return this.onResultMsg(m);
       case 'calibration':
         if (!this.replayLog) this.saveCalibration(m.td, m.axisSigns);

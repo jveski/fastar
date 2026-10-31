@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>fastar browser test harness</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden; }
+      #target { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+      #source { position: fixed; left: -10000px; top: 0; width: 640px; height: 480px; }
+      #synthetic { position: fixed; left: -10000px; top: 0; width: 640px; height: 480px; }
+      #start { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2; padding: 14px 22px; font: 16px system-ui; }
+      #status { position: fixed; left: 8px; right: 8px; bottom: 8px; margin: 0; color: #fff; font: 12px ui-monospace, monospace; white-space: pre-wrap; text-shadow: 0 0 3px #000; z-index: 2; }
+    </style>
+  </head>
+  <body>
+    <video id="target" muted playsinline></video>
+    <video id="source" muted playsinline loop></video>
+    <canvas id="synthetic" width="640" height="480"></canvas>
+    <button id="start">Start</button>
+    <pre id="status"></pre>
+    <script type="module" src="./harness.js"></script>
+  </body>
+</html>
