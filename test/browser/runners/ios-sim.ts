@@ -41,7 +41,8 @@ function bootSimulator(udid: string, erase: boolean): void {
 }
 
 async function startSession(sim: { udid: string; version: string }): Promise<string> {
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await createSession({
         platformName: 'iOS',
@@ -63,10 +64,20 @@ async function startSession(sim: { udid: string; version: string }): Promise<str
     } catch (e) {
       const message = (e as Error).message;
       console.log(`iOS session attempt ${attempt} failed: ${message.slice(0, 500)}`);
-      if (attempt === 2) throw e;
+      if (attempt === maxAttempts) throw e;
+      // A simulator LaunchServices hiccup can leave the freshly installed
+      // WebDriverAgent app unregistered ("Unknown application display
+      // identifier"). Remove it so Appium reinstalls cleanly, then reboot.
+      if (/WebDriverAgent|Unknown application display identifier|xcodebuild failed/i.test(message)) {
+        try {
+          execFileSync('xcrun', ['simctl', 'uninstall', sim.udid, 'com.facebook.WebDriverAgentRunner.xctrunner'], { stdio: 'ignore' });
+        } catch { /* not installed */ }
+      }
       // A corrupt boot needs a wipe; a Safari/remote-debugger miss only needs
       // a restart (erasing would put Safari back on its welcome screen).
       bootSimulator(sim.udid, /did not finish booting/i.test(message));
+      // Give SpringBoard/LaunchServices a moment after the reboot.
+      await new Promise((r) => setTimeout(r, 3000));
     }
   }
   throw new Error('unreachable');
