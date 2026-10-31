@@ -46,7 +46,11 @@ try {
   // Use the static scene for the overlay assertion: at ~3 fps, motion poses
   // can land a media tick late, which makes the moving sweep too noisy to be a
   // stable gate. Desktop and iOS still cover the sweep.
-  const replay = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=static&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.5&runMs=8000`);
+  //
+  // Emulator speed varies enough between runners that acquisition sometimes
+  // needs 4+ s. Quarter speed stretches the 3 s clip over 12 s of wall time;
+  // truth is keyed by mediaTime, so the comparison is unaffected.
+  const replay = await navigateAndRun(sessionId, `${BASE}/?mode=replay&scenario=static&no-webgl2=1&no-offscreen=1&useImu=0&rate=0.25&runMs=12000`);
   dump('static', replay);
   checkReplay('static', replay, { p95: 8, minFrames: 8, settle: 3, minErrors: 2 });
 

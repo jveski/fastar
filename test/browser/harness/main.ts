@@ -9,6 +9,9 @@ const LIB_URL = '/fastar.js';
 // lookup-table value from their user agent; pin it so mobile emulation is
 // compared against the same ground truth.
 const HFOV = 63;
+// All replay/live runs are shorter than this; only a stuck media element
+// should ever hit it.
+const RUN_TIMEOUT = 45_000;
 async function loadFastar(): Promise<typeof import('../../../src/index')> {
   return (await import(LIB_URL)) as typeof import('../../../src/index');
 }
@@ -85,6 +88,9 @@ function sleep(ms: number): Promise<void> {
 }
 
 function setDone(err: unknown = null): void {
+  // The watchdog may fire while a stuck await never settles; keep its error
+  // even if that await eventually resumes.
+  if (result.done) return;
   result.error = err ? String((err as Error)?.message ?? err) : null;
   result.endedAt = performance.now();
   result.done = true;
@@ -250,6 +256,10 @@ async function startReplay(log: SessionLog, ms: number): Promise<void> {
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
+  // Set the rate before playback starts: on a slow device the worker handshake
+  // can take seconds, and a clip that ran at 1x during startup may be over
+  // before acquisition gets a chance.
+  if (playbackRate > 0 && playbackRate !== 1) targetVideo.playbackRate = playbackRate;
   await ar.start({
     video: targetVideo, replay: { log, video: fixture(`${scenario}.mp4`) },
     syncDisplay: sync, forceCopyPath: forceCopy, useImu, hfov: HFOV,
@@ -350,6 +360,11 @@ async function workerSmokeTest(): Promise<string> {
 
 async function run(): Promise<void> {
   result.startedAt = performance.now();
+  // A browser that never starts playback (seen for canvas captureStream in
+  // Mobile Safari) would otherwise leave the runner polling forever.
+  const watchdog = setTimeout(() => {
+    setDone(new Error(`${mode} harness timed out after ${RUN_TIMEOUT} ms`));
+  }, RUN_TIMEOUT);
   try {
     localStorage.clear();
     result.diagnostics.worker = await workerSmokeTest();
@@ -367,6 +382,8 @@ async function run(): Promise<void> {
     setDone();
   } catch (e) {
     setDone(e);
+  } finally {
+    clearTimeout(watchdog);
   }
 }
 

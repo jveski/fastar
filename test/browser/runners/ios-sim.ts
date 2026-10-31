@@ -108,13 +108,20 @@ try {
   checkVideo(video, { minFrames: 3, locked: 0.3 });
 
   // Canvas captureStream is optional in Mobile Safari; replay is the required
-  // tracker check here. Exercise it when the runtime exposes it.
-  const stream = await navigateAndRun(sessionId, `${BASE}/?mode=stream&scenario=static&useImu=0&norvfc=1`);
-  console.log(`stream: ${stream.frames.length} frames, ${JSON.stringify(stream.stats)}`);
-  if (stream.error) {
-    console.log(`stream skipped: ${stream.error}`);
-  } else {
-    assert.ok(stream.frames.length > 3, `stream: too few frames (${stream.frames.length})`);
+  // tracker check here. Exercise it when the runtime exposes it, but do not
+  // fail the suite when Safari never starts the synthetic stream.
+  try {
+    const stream = await navigateAndRun(sessionId, `${BASE}/?mode=stream&scenario=static&useImu=0&norvfc=1`);
+    console.log(`stream: ${stream.frames.length} frames, ${JSON.stringify(stream.stats)}`);
+    if (stream.error) {
+      console.log(`stream skipped: ${stream.error}`);
+    } else {
+      assert.ok(stream.frames.length > 3, `stream: too few frames (${stream.frames.length})`);
+    }
+  } catch (e) {
+    const message = (e as Error).message;
+    if (!/harness did not (load|finish)/.test(message)) throw e;
+    console.log(`stream skipped: ${message}`);
   }
 
   console.log('iOS Safari suite passed');
