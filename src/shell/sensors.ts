@@ -53,6 +53,29 @@ export function screenAngle(): number {
   return typeof w === 'number' ? (w + 360) % 360 : 0;
 }
 
+/**
+ * Maps Generic Sensor timestamps onto performance.now(). Chrome on Android
+ * passes SensorEvent.timestamp (elapsedRealtimeNanos, which keeps counting
+ * while the device sleeps) through as if it were the monotonic clock, so
+ * readings are stamped ahead of performance.now() by the time the device has
+ * spent asleep since boot: hours, typically. The clock offset is the least
+ * delivery delay seen (the lower envelope of now - stamp); stamps already on
+ * performance.now() (a plausible least delay) are kept as they are.
+ */
+export class SensorTimebase {
+  private offset = NaN;
+
+  constructor(private readonly maxDelay = 1000) {}
+
+  map(stamp: number | null | undefined, now: number): number {
+    if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return now;
+    const d = now - stamp;
+    // Sleep only ever moves the sensor clock ahead, so the least delay only drops.
+    if (!(d >= this.offset)) this.offset = d;
+    return this.offset >= 0 && this.offset < this.maxDelay ? stamp : stamp + this.offset;
+  }
+}
+
 interface GenericSensor extends EventTarget {
   x: number; y: number; z: number; timestamp: number;
   start(): void; stop(): void;
@@ -140,6 +163,7 @@ export class MotionSensors {
       const gyro = new G.Gyroscope({ frequency: this.frequency, referenceFrame: 'device' });
       const GravCtor = G.GravitySensor ?? G.Accelerometer;
       const grav = GravCtor ? new GravCtor({ frequency: Math.min(60, this.frequency), referenceFrame: 'device' }) : null;
+      const timebase = new SensorTimebase();
       const ok = await new Promise<boolean>((resolve) => {
         let settled = false;
         const done = (v: boolean) => { if (!settled) { settled = true; resolve(v); } };
@@ -149,7 +173,7 @@ export class MotionSensors {
           const ang = screenAngle();
           deviceToCamera(gyro.x, gyro.y, gyro.z, ang, this.facing, this.g);
           this.onSample({
-            t: gyro.timestamp, gx: this.g[0], gy: this.g[1], gz: this.g[2],
+            t: timebase.map(gyro.timestamp, performance.now()), gx: this.g[0], gy: this.g[1], gz: this.g[2],
             ax: this.lastAccel[0], ay: this.lastAccel[1], az: this.lastAccel[2],
           });
         };
