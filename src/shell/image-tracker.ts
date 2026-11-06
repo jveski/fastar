@@ -16,11 +16,12 @@ import type { ClockState, FrameTargetInfo } from '../track/pipeline';
 import { Recorder, type SessionLog } from './recorder';
 import { Surface, SurfaceFeed } from './surface';
 import { AccelSigns } from '../fusion/gravity';
+import { ContentManager, type ContentOptions } from './content';
 
 export interface CreateOptions {
   /** URL of a compiled targets file, or its bytes. */
   targets: string | URL | ArrayBuffer;
-  /** Max simultaneously tracked targets. */
+  /** Most targets tracked at once (default: all of them). */
   maxTrack?: number;
   /** Load the worker from a URL instead of the inlined source (strict CSP). */
   workerUrl?: string | URL;
@@ -40,6 +41,21 @@ export interface CreateOptions {
    * targets and options. Video targets are always tracked as rigid.
    */
   deformable?: boolean | DeformableOptions;
+  /**
+   * Bound the time spent per camera frame. Every target in view is tracked,
+   * but the less prominent ones (smaller, partly out of view, off centre)
+   * with fewer points, or on fewer frames, when time is short.
+   */
+  budget?: TrackingBudget;
+}
+
+export interface TrackingBudget {
+  /** Tracking time per frame (ms; default: `share` of the frame interval). */
+  trackMs?: number;
+  /** Share of the frame interval spent tracking (default 0.6). */
+  share?: number;
+  /** Time per pass looking for targets not yet tracked (ms, default 20; at least one target is always tried). */
+  acquireMs?: number;
 }
 
 export interface DeformableOptions {
@@ -159,10 +175,17 @@ export interface TrackerStats {
   acquireReady: boolean;
   td: number;
   tdCalibrated: boolean;
+  /** Tracked targets, with their priority, points and update rate under the budget. */
   targets: FrameTargetInfo[];
+  /** Tracking time allowed per frame (ms). */
+  budgetMs: number;
 }
 
 type Listener = (index: number) => void;
+type TargetEvent = 'found' | 'lost' | 'near';
+
+/** A target nearly found is reported at most this often (ms). */
+const NEAR_INTERVAL = 1000;
 
 const STORAGE = 'fastar:';
 // Bump when a sensor-mapping or timestamp change makes stored IMU calibrations invalid.
@@ -181,7 +204,7 @@ export class ImageTracker {
   intrinsics: Intrinsics | null = null;
   readonly stats: TrackerStats = {
     path: 'none', sensors: 'none', motionPermission: 'not-requested', imuSamples: 0, fps: 0, latency: 0, timings: null,
-    trackerReady: false, acquireReady: false, td: 0, tdCalibrated: false, targets: [],
+    trackerReady: false, acquireReady: false, td: 0, tdCalibrated: false, targets: [], budgetMs: 0,
   };
   readonly recorder: Recorder;
   /** Called with every worker result (benchmark / debugging). */
@@ -205,7 +228,9 @@ export class ImageTracker {
   private readonly confidence = new Map<number, number>();
   private readonly clocks = new Map<number, ClockState>();
   private readonly shown = new Set<number>();
-  private readonly listeners = { found: new Set<Listener>(), lost: new Set<Listener>() };
+  private readonly listeners: Record<TargetEvent, Set<Listener>> = { found: new Set(), lost: new Set(), near: new Set() };
+  private readonly nearAt = new Map<number, number>();
+  private readonly priorities = new Map<number, number>();
   private readonly frameListeners = new Set<(e: FrameEvent) => void>();
   private readonly pool: ArrayBuffer[] = [];
   private busy = false;
@@ -242,8 +267,8 @@ export class ImageTracker {
 
   private constructor(buffer: ArrayBuffer, o: CreateOptions) {
     this.buffer = buffer;
-    this.o = { maxTrack: 1, showThreshold: 0.5, hideThreshold: 0.2, ...o };
     this.targets = decodeTargets(buffer.slice(0)).map((t) => t.meta);
+    this.o = { maxTrack: Math.max(1, this.targets.length), showThreshold: 0.5, hideThreshold: 0.2, ...o };
     const d = o.deformable;
     const chosen = !d ? [] : d === true || !d.targets ? this.targets.map((_, i) => i) : d.targets;
     this.deformable = chosen.filter((i) => this.targets[i] && !this.targets[i].video);
@@ -349,6 +374,7 @@ export class ImageTracker {
     this.predictors.clear();
     this.smoothers.clear();
     this.shown.clear();
+    this.nearAt.clear();
     this.clocks.clear();
     this.surfaces.clear();
     this.accelSigns.reset();
@@ -362,9 +388,42 @@ export class ImageTracker {
     return this.fit;
   }
 
-  on(event: 'found' | 'lost', cb: Listener): () => void {
+  /**
+   * 'found' / 'lost': a target came into view or left it. 'near': a target
+   * not yet tracked nearly matched (far away, blurred, coming into view);
+   * it is likely found soon, so its content can start loading.
+   */
+  on(event: TargetEvent, cb: Listener): () => void {
     this.listeners[event].add(cb);
     return () => this.listeners[event].delete(cb);
+  }
+
+  /** Target `index` is in view (between its 'found' and 'lost'). */
+  isShown(index: number): boolean {
+    return this.shown.has(index);
+  }
+
+  /** Index of the target compiled with this name, or -1. */
+  targetIndex(name: string): number {
+    return this.targets.findIndex((t) => t.name === name);
+  }
+
+  /**
+   * Weight target `index` in the tracking budget (default 1): 2 counts it
+   * as twice as prominent as it looks, 0 keeps it at the fewest points.
+   */
+  setPriority(index: number, weight: number): void {
+    this.priorities.set(index, weight);
+    this.post({ type: 'priority', index, weight });
+  }
+
+  /**
+   * Load each target's content when it is found (or nearly found), and
+   * unload content that has been out of view a while when room is needed.
+   * See ContentOptions.
+   */
+  content<T>(o: ContentOptions<T>): ContentManager<T> {
+    return new ContentManager(this, o);
   }
 
   onFrame(cb: (e: FrameEvent) => void): () => void {
@@ -442,10 +501,13 @@ export class ImageTracker {
       acquirePort: ch.port1, eskf: this.o.filter, tracker: this.o.tracker, calibrateFocal: !this.replayLog && this.storedFocal() === null,
       deformable: this.deformable,
       surface: typeof this.o.deformable === 'object' && this.o.deformable.grid ? { grid: this.o.deformable.grid } : undefined,
+      budget: this.o.budget ? { budgetMs: this.o.budget.trackMs, ...(this.o.budget.share !== undefined ? { share: this.o.budget.share } : {}) } : undefined,
+      acquireBudgetMs: this.o.budget?.acquireMs,
     };
     this.tracker.postMessage(init, [init.targets, ch.port1]);
     this.tracker.onmessage = (e) => this.onWorker(e.data as FromTracker);
     this.tracker.onerror = (e) => console.error('fastar worker error', e.message);
+    for (const [index, weight] of this.priorities) this.post({ type: 'priority', index, weight });
   }
 
   private post(m: ToTracker, transfer: Transferable[] = []): void {
@@ -505,6 +567,7 @@ export class ImageTracker {
       this.stats.latency = m.doneAt - m.t;
       this.stats.timings = m.timings;
       this.stats.targets = m.targets;
+      this.stats.budgetMs = m.budget;
       if (m.t > this.lastResultTime) this.lastResultTime = m.t;
     }
     this.stats.td = m.td;
@@ -540,6 +603,12 @@ export class ImageTracker {
         this.smoothers.delete(i);
         this.listeners.lost.forEach((cb) => cb(i));
       }
+    }
+    const now = performance.now();
+    for (const i of m.near ?? []) {
+      if (this.shown.has(i) || now - (this.nearAt.get(i) ?? -Infinity) < NEAR_INTERVAL) continue;
+      this.nearAt.set(i, now);
+      this.listeners.near.forEach((cb) => cb(i));
     }
     this.onResult?.(m);
     if (this.syncDisplay) this.flushDisplay();

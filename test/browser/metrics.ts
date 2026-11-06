@@ -43,10 +43,13 @@ export function overlayErrors(r: HarnessResult, t: Truth, offsetFrames = 0): num
     const gt = frameTruth(f, t, offsetFrames);
     if (!gt?.visible || !f.poses.length) continue;
     for (const pose of f.poses) {
+      // Several targets: each pose against its own target's truth, while that is in view.
+      const g = gt.targets ? gt.targets[pose.index] : gt;
+      if (!g || ('inView' in g && g.inView < 0.95)) continue;
       let e = 0, n = 0;
       for (const [X, Y] of corners) {
         if (!projectPoint(t.intrinsics, pose.R, pose.t, X, Y, pe)) continue;
-        if (!projectPoint(t.intrinsics, gt.R, gt.tv, X, Y, pg)) continue;
+        if (!projectPoint(t.intrinsics, g.R, g.tv, X, Y, pg)) continue;
         e += Math.hypot(pe[0] - pg[0], pe[1] - pg[1]);
         n++;
       }
@@ -54,6 +57,11 @@ export function overlayErrors(r: HarnessResult, t: Truth, offsetFrames = 0): num
     }
   }
   return out;
+}
+
+/** overlayErrors of one target only. */
+export function targetOverlayErrors(r: HarnessResult, t: Truth, index: number, offsetFrames = 0): number[] {
+  return overlayErrors({ ...r, frames: r.frames.map((f) => ({ ...f, poses: f.poses.filter((p) => p.index === index) })) }, t, offsetFrames);
 }
 
 /**

@@ -37,7 +37,8 @@ exists on the repository's default branch.
 ## What is covered
 
 - **Replay** of deterministic rendered scenes (`static`, `sweep`, `occlusion`,
-  `video`, and `curl`, a page that bends, tracked with `deformable`) through
+  `video`, `curl`, a page that bends, tracked with `deformable`, and `multi`,
+  two posters tracked at once, also on a tight tracking budget) through
   `start({ replay: { log, video } })`, with per-frame ground truth and overlay
   (or surface) accuracy assertions.
 - **Live stream** input from a canvas `captureStream`, including `syncDisplay`.
@@ -71,6 +72,7 @@ This produces:
 | `*.truth.json` | per-frame target pose, visibility, video time |
 | `targets-image.bin` | compiled poster target |
 | `targets-video.bin` | compiled motion-clip target |
+| `targets-multi.bin` | two poster targets (`multi`) |
 | `target.png` | poster target for inspection |
 
 The harness pins `hfov: 63` because the fixtures use that field of view. Real

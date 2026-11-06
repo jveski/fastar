@@ -21,10 +21,13 @@ export class AcquireCore {
     if (!acq) return;
     if (m.type === 'intrinsics') { acq.K = m.K; return; }
     const t0 = this.now();
-    const r = acq.acquire(new Uint8Array(m.luma), { exclude: m.exclude, up: m.up });
-    let result: WireAcquireResult | null = null;
-    if (r) result = { target: r.target, R: r.R, t: r.t, H: r.H, inliers: r.inliers, cov: r.cov, frame: r.frame, tgt: r.tgt, time: r.time };
-    const msg: AcquireToTracker = { type: 'acquired', frameId: m.frameId, result, ms: this.now() - t0 };
+    const b = acq.acquireAll(new Uint8Array(m.luma), {
+      exclude: m.exclude, up: m.up, maxResults: m.maxResults, priority: m.priority, budgetMs: m.budgetMs, occupied: m.occupied,
+    });
+    const results: WireAcquireResult[] = b.results.map((r) => ({
+      target: r.target, R: r.R, t: r.t, H: r.H, inliers: r.inliers, cov: r.cov, frame: r.frame, tgt: r.tgt, time: r.time,
+    }));
+    const msg: AcquireToTracker = { type: 'acquired', frameId: m.frameId, results, near: b.near, ms: this.now() - t0 };
     this.port!.postMessage(msg);
   }
 }

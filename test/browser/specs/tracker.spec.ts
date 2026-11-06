@@ -1,6 +1,6 @@
 import { expect, test, type TestInfo } from '@playwright/test';
 import {
-  bestOffset, bestSurfaceErrors, expectNoErrors, firstLockMs, percentile, runHarness, settled, staticJitterMm, truth,
+  bestOffset, bestSurfaceErrors, expectNoErrors, firstLockMs, frameTruth, percentile, runHarness, settled, staticJitterMm, targetOverlayErrors, truth,
   videoLockedRatio, videoTimeErrors, visibleRatio,
 } from '../metrics';
 
@@ -116,4 +116,39 @@ test.describe('tracker end to end', () => {
     expectNoErrors(r);
     expect(r.frames.length).toBeGreaterThan(10);
   });
+
+  for (const tight of [false, true]) {
+    test(`replays two targets side by side: tracks both at once${tight ? ', on a tight tracking budget' : ''}`, async ({ page }) => {
+      const t = truth('multi');
+      const r = await runHarness(page, { mode: 'replay', scenario: 'multi', target: 'targets-multi.bin', ...(tight ? { trackMs: 1 } : {}) });
+      expectNoErrors(r);
+      expect([...new Set(r.events.foundIndex)].sort()).toEqual([0, 1]);
+      // While both are fully in view, both have poses.
+      const both = r.frames.filter((f) => frameTruth(f, t).targets!.every((x) => x.inView > 0.95));
+      expect(both.length).toBeGreaterThan(30);
+      expect(both.filter((f) => f.poses.length === 2).length / both.length).toBeGreaterThan(0.85);
+      // Each target where it really is (replays can start a frame or two off: use target 0's best offset for both).
+      const s = settled(r);
+      let offset = 0, best = Infinity;
+      for (let o = -6; o <= 6; o++) {
+        const m = percentile(targetOverlayErrors(s, t, 0, o), 0.5);
+        if (m < best) { best = m; offset = o; }
+      }
+      for (const i of [0, 1]) {
+        const errors = targetOverlayErrors(s, t, i, offset);
+        expect(errors.length).toBeGreaterThan(30);
+        // A 1 ms budget updates the less prominent poster only every few frames (and WebKit
+        // times to the millisecond): coarser, but still on the poster.
+        expect(percentile(errors, 0.5)).toBeLessThan(tight ? 6 : 3);
+        expect(percentile(errors, 0.95)).toBeLessThan(tight ? 20 : 12);
+      }
+      expect(r.stats!.budgetMs).toBeGreaterThan(0);
+      if (tight) expect(r.stats!.budgetMs).toBe(1);
+      for (const x of r.stats!.targets) {
+        expect(x.priority).toBeGreaterThanOrEqual(0);
+        expect(x.points).toBeGreaterThanOrEqual(24);
+        expect(x.points).toBeLessThanOrEqual(150);
+      }
+    });
+  }
 });

@@ -2,6 +2,7 @@
 // pass your THREE namespace (for Group) and camera/scene/renderer.
 import type { ImageTracker, FrameEvent } from '../shell/image-tracker';
 import { Surface } from '../shell/surface';
+import { ContentManager, type ContentLoadContext, type ContentOptions } from '../shell/content';
 
 interface Matrix4Like {
   fromArray(a: ArrayLike<number>): unknown;
@@ -16,6 +17,8 @@ export interface Object3DLike {
   matrixWorldNeedsUpdate: boolean;
   visible: boolean;
   add?(o: unknown): unknown;
+  remove?(o: unknown): unknown;
+  traverse?(f: (o: unknown) => void): void;
 }
 
 export interface CameraLike extends Object3DLike {
@@ -76,6 +79,26 @@ export interface ThreeAdapterOptions {
   render?: (e: FrameEvent) => void;
   /** Size of the rendered view in CSS pixels (defaults to the video element box). */
   viewSize?: () => [number, number];
+  /** How much lazily loaded content (see content()) stays loaded, and for how long. */
+  content?: Pick<ContentOptions<unknown>, 'budget' | 'keepAlive' | 'nearTimeout' | 'concurrency' | 'onError'>;
+}
+
+export interface ThreeContentOptions<T> {
+  /** Load ahead, and keep loaded. */
+  preload?: boolean;
+  /** Weight against the content budget (default 1). */
+  size?: number;
+  /** The target came into view with this content (e.g. play a video texture). */
+  show?(value: T): void;
+  /** The target went out of view. */
+  hide?(value: T): void;
+  /** Extra cleanup when unloaded, after the object is removed and its geometries, materials and textures disposed. */
+  unload?(value: T): void;
+}
+
+interface Registered {
+  load(ctx: ContentLoadContext): Promise<Object3DLike> | Object3DLike;
+  o: ThreeContentOptions<Object3DLike>;
 }
 
 /**
@@ -91,6 +114,8 @@ export class ThreeAdapter {
   private readonly textures = new Map<unknown, TextureLike>();
   private readonly meshes: Array<{ index: number; geometry: GeometryLike; segX: number; segY: number }> = [];
   private readonly off: () => void;
+  private readonly loaders = new Map<number, Registered>();
+  private manager: ContentManager<Object3DLike> | null = null;
 
   constructor(private readonly ar: ImageTracker, private readonly o: ThreeAdapterOptions) {
     const cam = o.camera;
@@ -98,6 +123,43 @@ export class ThreeAdapter {
     cam.matrix.identity?.();
     cam.matrixWorldNeedsUpdate = true;
     this.off = ar.onFrame((e) => this.update(e));
+  }
+
+  /**
+   * Lazily loaded content for target `index`: `load` runs when the target is
+   * found (or nearly found), and the object it returns is added to the
+   * target's anchor. Once the target has been out of view a while and room
+   * is needed, the object is removed and disposed (see the `content` option
+   * for the budget).
+   */
+  content<T extends Object3DLike>(index: number, load: (ctx: ContentLoadContext) => Promise<T> | T, o: ThreeContentOptions<T> = {}): void {
+    if (!this.ar.targets[index]) throw new Error(`fastar: no target ${index}`);
+    this.loaders.set(index, { load, o: o as ThreeContentOptions<Object3DLike> });
+    if (!this.manager) {
+      const m = (this.manager = new ContentManager<Object3DLike>(this.ar, {
+        ...this.o.content,
+        targets: [],
+        load: (i, ctx) => this.loaders.get(i)!.load(ctx),
+        size: (i) => this.loaders.get(i)?.o.size ?? 1,
+        show: (i, v) => this.loaders.get(i)?.o.show?.(v),
+        hide: (i, v) => this.loaders.get(i)?.o.hide?.(v),
+        unload: (i, v) => {
+          this.anchors.get(i)?.remove?.(v);
+          disposeObject(v);
+          this.loaders.get(i)?.o.unload?.(v);
+        },
+      }));
+      m.on('ready', (i) => {
+        const v = m.get(i);
+        if (v) (this.anchors.get(i) ?? this.anchor(i)).add?.(v);
+      });
+    }
+    this.manager.add(index, !!o.preload);
+  }
+
+  /** The content manager behind content() (state, budget, events), once content is registered. */
+  get contents(): ContentManager<Object3DLike> | null {
+    return this.manager;
   }
 
   /** Anchor object for target `index` (created via THREE.Group if not supplied). */
@@ -201,9 +263,29 @@ export class ThreeAdapter {
 
   dispose(): void {
     this.off();
+    this.manager?.dispose();
+    this.manager = null;
     for (const t of this.textures.values()) t.dispose?.();
     this.textures.clear();
     for (const m of this.meshes) m.geometry.dispose?.();
     this.meshes.length = 0;
   }
+}
+
+interface Disposable { dispose?(): void }
+
+/** Dispose the geometries, materials and textures under a three.js object. */
+export function disposeObject(root: unknown): void {
+  const visit = (o: unknown) => {
+    const n = o as { geometry?: Disposable; material?: Disposable | Disposable[] };
+    n.geometry?.dispose?.();
+    const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
+    for (const m of mats) {
+      for (const v of Object.values(m)) if ((v as { isTexture?: boolean } | null)?.isTexture) (v as Disposable).dispose?.();
+      m.dispose?.();
+    }
+  };
+  const r = root as Object3DLike;
+  if (r.traverse) r.traverse(visit);
+  else visit(root);
 }

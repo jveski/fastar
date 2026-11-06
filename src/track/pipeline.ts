@@ -11,6 +11,7 @@ import { rateAt } from '../fusion/predict';
 import { mat3, mat3FromQuat, mat3TVec } from '../math/rot';
 import { RollingShutterEstimator } from './rolling-shutter';
 import { SurfaceTracker, type SurfaceOptions } from '../deform/surface-tracker';
+import { CostModel, DEFAULT_BUDGET, allocate, screenPriority, type BudgetOptions, type Demand } from './budget';
 
 export interface PipelineOptions {
   width: number;
@@ -33,6 +34,8 @@ export interface PipelineOptions {
   surface?: Partial<SurfaceOptions>;
   eskf?: Partial<EskfOptions>;
   clock?: Partial<ClockOptions>;
+  /** How tracking time per frame is bounded and shared among targets. */
+  budget?: Partial<BudgetOptions>;
 }
 
 export const DEFAULT_PIPELINE: Omit<PipelineOptions, 'width' | 'height'> = {
@@ -65,6 +68,15 @@ export interface TargetSlot {
   /** Camera time of the last successful vision update. */
   lastSeen: number;
   nis: number;
+  /** Tracking budget: importance this frame, points allowed, and tracked on every `every`-th frame. */
+  priority: number;
+  points: number;
+  every: number;
+  /** Frame the tracker last ran on. */
+  lastFrame: number;
+  /** The filter's predicted pose for the current frame. */
+  readonly predR: Float64Array;
+  readonly predT: Float64Array;
 }
 
 export interface FrameTargetInfo {
@@ -78,6 +90,10 @@ export interface FrameTargetInfo {
   videoTime?: number;
   videoTimeStd?: number;
   videoLocked?: boolean;
+  /** Tracking budget: importance (0 out of view to ~1 filling it), points allowed, frames between updates. */
+  priority?: number;
+  points?: number;
+  every?: number;
 }
 
 /** Video clock state for the render side: video time = (camera time - offset) mod duration. */
@@ -124,7 +140,14 @@ export interface FrameResult {
   lost: number[];
   wantAcquire: boolean;
   timings: FrameTimings;
+  /** Tracking time allowed for this frame (ms). */
+  budget: number;
 }
+
+/** Floors of the tracking budget: points every target keeps, by kind. */
+const MIN_POINTS_VIDEO = 40;
+/** Seconds a lost target stays first in line for acquisition. */
+const RECENT = 5;
 
 export class Pipeline {
   readonly o: PipelineOptions;
@@ -167,9 +190,27 @@ export class Pipeline {
   private tdCheckFrame = 0;
   /** Rolling-shutter readout, estimated once t_d is known (the gyro must line up with the frames). */
   readonly rollingShutter = new RollingShutterEstimator();
+  /** Tracking budget: options, cost per frame by kind of target, and the frame timing it follows. */
+  private readonly bo: BudgetOptions;
+  readonly costs = {
+    image: new CostModel(0.2, 0.008),
+    video: new CostModel(0.4, 0.012),
+    surface: new CostModel(0.5, 0.012),
+  };
+  private frameDt = 1 / 30;
+  private pyramidMs = NaN;
+  private prevFrameTime = NaN;
+  private topIndex = -1;
+  /** App-set priority weights by target index (default 1). */
+  private readonly weights = new Map<number, number>();
+  /** Camera time each target was last lost. */
+  private readonly lostAt = new Map<number, number>();
+  /** Tracking time allowed in the last frame (ms). */
+  budgetMs = 0;
 
   constructor(readonly targets: TargetData[], public K: Intrinsics, opts: Partial<PipelineOptions> & { width: number; height: number }) {
     this.o = { ...DEFAULT_PIPELINE, ...opts };
+    this.bo = { ...DEFAULT_BUDGET, ...this.o.budget };
     this.ring = Array.from({ length: this.o.ringSize }, () => new Pyramid(opts.width, opts.height, 3));
     this.ringId = new Int32Array(this.o.ringSize).fill(-1);
     this.ringTime = new Float64Array(this.o.ringSize);
@@ -267,25 +308,47 @@ export class Pipeline {
   processFrame(luma: Uint8Array, tCam: number): FrameResult {
     const t0 = now();
     this.lastTime = tCam;
+    const dt = tCam - this.prevFrameTime;
+    if (dt > 0) this.frameDt += 0.1 * (Math.min(0.1, Math.max(1 / 120, dt)) - this.frameDt);
+    this.prevFrameTime = tCam;
     const id = ++this.frameId;
     const k = id % this.o.ringSize;
-    const prevK = this.ringSlot(id - 1);
     this.ring[k].build(luma);
     this.ringId[k] = id;
     this.ringTime[k] = tCam;
     const t1 = now();
+    this.pyramidMs = Number.isNaN(this.pyramidMs) ? t1 - t0 : this.pyramidMs + 0.1 * (t1 - t0 - this.pyramidMs);
     const cur = this.ring[k];
     const found = this.pendingFound, lost: number[] = [];
     this.pendingFound = [];
     const imu = this.o.useImu ? this.imu : null;
     let trackT = 0, fusionT = 0, klt = 0, ncc = 0, solve = 0;
+    // Bring every filter up to date and predict this frame's pose: newest
+    // gyro sample, or the frame time without an IMU.
+    for (const s of this.slots) {
+      const ta = now();
+      s.eskf.flushPending(imu);
+      s.eskf.propagateTo(imu ? imu.latestTime : tCam + s.eskf.td, imu);
+      if (!s.eskf.poseAt(tCam, s.predR, s.predT, imu)) { s.predR.set(s.tracker.R); s.predT.set(s.tracker.t); }
+      fusionT += now() - ta;
+    }
+    this.plan();
     for (let si = this.slots.length - 1; si >= 0; si--) {
       const s = this.slots[si];
       const ta = now();
-      s.eskf.flushPending(imu);
-      // Bring the filter up to date: newest gyro sample, or the frame time without an IMU.
-      s.eskf.propagateTo(imu ? imu.latestTime : tCam + s.eskf.td, imu);
-      if (!s.eskf.poseAt(tCam, this.R, this.t, imu)) { this.R.set(s.tracker.R); this.t.set(s.tracker.t); }
+      // Low on budget: this target is only updated every few frames; the filter carries it in between.
+      if (id - s.lastFrame < s.every) {
+        if (s.status === 'coasting' && !this.isVisible(s, tCam)) {
+          this.slots.splice(si, 1);
+          this.lostAt.set(s.index, tCam);
+          lost.push(s.index);
+        }
+        continue;
+      }
+      const prevK = this.ringSlot(s.lastFrame);
+      s.lastFrame = id;
+      this.R.set(s.predR);
+      this.t.set(s.predT);
       if (imu && imu.count > 0) {
         const w = rateAt(imu, tCam + s.eskf.td, s.tracker.omega), b = s.eskf.bg;
         w[0] -= b[0]; w[1] -= b[1]; w[2] -= b[2];
@@ -303,7 +366,8 @@ export class Pipeline {
       let ok: boolean;
       // A video cut retires most tracked points: re-seed from the new shot's.
       const thin = clock && (s.tracker.n < s.tracker.o.minInliers + 4 || s.tracker.n < 0.4 * had);
-      if (s.status === 'tracking' && prevK >= 0 && !thin) {
+      const tracked = s.status === 'tracking' && prevK >= 0 && !thin;
+      if (tracked) {
         const before = s.tracker.n;
         ok = s.tracker.track(this.ring[prevK], cur, this.R, this.t);
         // Video: most of the points still expected on screen failing at once
@@ -312,7 +376,7 @@ export class Pipeline {
         if (ok && clock && s.tracker.inliers < 0.3 * before && s.tracker.inliers < 20) ok = s.tracker.ok = false;
       } else {
         // Coasting: try to re-lock locally around the gyro-propagated pose.
-        ok = s.tracker.init(cur, this.R, this.t, thin ? s.tracker.numTrackPoints : 80, 16);
+        ok = s.tracker.init(cur, this.R, this.t, thin ? s.tracker.numTrackPoints : Math.max(30, Math.round(80 * this.loadShare(s))), 16);
       }
       // Video: the tracked points fit, but hardly any other point can be
       // found where this time and pose put it. Search both again.
@@ -328,6 +392,7 @@ export class Pipeline {
       if (ok && clock) this.probeClock(clock, vt!, cur, tCam, id);
       const tc = now();
       trackT += tc - tb;
+      if (tracked) this.costModel(s).observe(s.tracker.load.maxPoints, tc - tb);
       klt += s.tracker.timings.klt; ncc += s.tracker.timings.ncc; solve += s.tracker.timings.solve;
       if (ok && vt && imu && this.tdCalibrated && s === this.slots[0]) this.rollingShutter.observe(vt);
       if (imu && !this.tdCalibrated && this.o.calibrateTd && s === this.slots[0]) {
@@ -347,6 +412,7 @@ export class Pipeline {
       }
       if (s.status === 'coasting' && !this.isVisible(s, tCam)) {
         this.slots.splice(si, 1);
+        this.lostAt.set(s.index, tCam);
         lost.push(s.index);
       }
       fusionT += (tb - ta) + (now() - tc);
@@ -359,7 +425,9 @@ export class Pipeline {
     }
     const tracking = this.slots.filter((s) => s.status === 'tracking').length;
     const timeLost = this.slots.some((s) => this.timeLost(s.index));
-    const wantAcquire = (tracking < this.o.maxTrack || timeLost) && (tracking === 0 || id - this.lastAcqFrame >= this.o.acquireInterval);
+    // Short of budget even for the floors: look for more targets less often too.
+    const interval = this.slots.some((s) => s.every > 1) ? 2 * this.o.acquireInterval : this.o.acquireInterval;
+    const wantAcquire = (tracking < this.o.maxTrack || timeLost) && (tracking === 0 || id - this.lastAcqFrame >= interval);
     const t2 = now();
     return {
       frameId: id,
@@ -369,7 +437,83 @@ export class Pipeline {
       lost,
       wantAcquire,
       timings: { pyramid: t1 - t0, track: trackT, fusion: fusionT, total: t2 - t0, klt, ncc, solve },
+      budget: this.budgetMs,
     };
+  }
+
+  /** Weight a target's priority in the tracking budget (default 1; 0 tracks it at the floor). */
+  setPriority(index: number, weight: number): void {
+    if (weight === 1) this.weights.delete(index);
+    else this.weights.set(index, Math.max(0, weight));
+  }
+
+  private costModel(s: TargetSlot): CostModel {
+    return s.tracker instanceof SurfaceTracker ? this.costs.surface : s.tracker.video ? this.costs.video : this.costs.image;
+  }
+
+  /** Share of its full point count a target may use this frame. */
+  private loadShare(s: TargetSlot): number {
+    return s.tracker.load.maxPoints / s.tracker.o.maxPoints;
+  }
+
+  private minPoints(s: TargetSlot): number {
+    const tr = s.tracker, max = tr.o.maxPoints, base = 3 * tr.o.minInliers;
+    let min = base;
+    if (tr instanceof SurfaceTracker) min = Math.max(base, Math.round(1.5 * tr.cells));
+    else if (tr.video) min = Math.max(base, MIN_POINTS_VIDEO);
+    return Math.min(max, min);
+  }
+
+  /** Share this frame's tracking time among the targets (see budget.ts). */
+  private plan(): void {
+    const bo = this.bo, demands: Demand[] = [];
+    for (const s of this.slots) {
+      const m = this.targets[s.index].meta;
+      const hw = m.physicalWidth / 2, hh = (m.physicalWidth * m.height) / m.width / 2;
+      let p = screenPriority(this.K, s.predR, s.predT, hw, hh).score * (this.weights.get(s.index) ?? 1);
+      if (s.index === this.topIndex) p *= bo.stickiness;
+      if (s.status === 'coasting') p *= 0.5;
+      s.priority = p;
+      const c = this.costModel(s);
+      demands.push({
+        index: s.index, priority: p, minPoints: this.minPoints(s), maxPoints: s.tracker.o.maxPoints,
+        current: s.points, fixed: c.fixed, perPoint: c.perPoint,
+      });
+    }
+    const budget = (this.budgetMs = bo.budgetMs ?? Math.max(1, bo.share * this.frameDt * 1000 - (this.pyramidMs || 0)));
+    const alloc = allocate(demands, budget, bo);
+    for (const a of alloc) {
+      const s = this.slot(a.index)!;
+      s.points = a.points;
+      s.every = a.every;
+      s.tracker.setLoad(a.points);
+    }
+    this.topIndex = alloc[0]?.index ?? -1;
+  }
+
+  /** Targets lost within the last few seconds, most recent first (to try first when acquiring). */
+  recentlyLost(): number[] {
+    const out: Array<[number, number]> = [];
+    for (const [i, t] of this.lostAt) {
+      if (this.lastTime - t > RECENT || this.slot(i)) continue;
+      out.push([i, t]);
+    }
+    return out.sort((a, b) => b[1] - a[1]).map((x) => x[0]);
+  }
+
+  /** Frame quads (4 corners each, flattened) of the tracked targets, at their latest poses. */
+  trackedQuads(): number[] {
+    const out: number[] = [], K = this.K;
+    for (const s of this.slots) {
+      if (s.status !== 'tracking') continue;
+      const m = this.targets[s.index].meta, R = s.tracker.R, t = s.tracker.t;
+      const hw = m.physicalWidth / 2, hh = (m.physicalWidth * m.height) / m.width / 2;
+      for (const [X, Y] of [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]]) {
+        const z = Math.max(1e-6, R[6] * X + R[7] * Y + t[2]);
+        out.push((K.fx * (R[0] * X + R[1] * Y + t[0])) / z + K.cx, (K.fy * (R[3] * X + R[4] * Y + t[1])) / z + K.cy);
+      }
+    }
+    return out;
   }
 
   private targetInfo(s: TargetSlot, tCam: number): FrameTargetInfo {
@@ -380,6 +524,9 @@ export class Pipeline {
       rms: s.tracker.rms,
       nis: s.nis,
       confidence: this.confidence(s, tCam),
+      priority: s.priority,
+      points: s.tracker.load.maxPoints,
+      every: s.every,
     };
     const clock = this.clocks.get(s.index);
     if (clock) {
@@ -424,10 +571,12 @@ export class Pipeline {
     const wide = tCam - last > SWEEP_INTERVAL || tCam < last;
     if (wide) this.sweepTime.set(clock, tCam);
     // While few points agree with the pose, the time may be off by more than
-    // the clock thinks: look further around it.
-    const margin = tr.n > 0 && tr.n < WEAK_SUPPORT * tr.o.maxPoints ? SEARCH_REACH : 2;
+    // the clock thinks: look further around it. Probes scale with the
+    // target's share of the tracking budget.
+    const share = Math.max(0.3, tr.load.maxPoints / tr.o.maxPoints);
+    const margin = tr.n > 0 && tr.n < WEAK_SUPPORT * tr.load.maxPoints ? SEARCH_REACH : 2;
     const n = wide ? clock.sweep(this.candFrames, MAX_CANDIDATES, this.sweepPhase++) : clock.candidates(tCam, this.candFrames, MAX_CANDIDATES, margin, id);
-    const probes = wide ? 24 : Math.max(4, Math.min(24, Math.floor(PROBE_EVALS / n)));
+    const probes = wide ? Math.round(24 * share) : Math.max(4, Math.min(24, Math.floor((PROBE_EVALS * share) / n)));
     const llr = this.llrFor(clock);
     const used = tr.probeTime(frame.levels[0], this.candFrames, n, llr, probes);
     if (used > 0) {
@@ -553,11 +702,16 @@ export class Pipeline {
     }
     const isNew = !s;
     if (!s) {
-      s = { index: res.target, tracker, eskf, status: 'tracking', lastSeen: 0, nis: NaN };
+      s = {
+        index: res.target, tracker, eskf, status: 'tracking', lastSeen: 0, nis: NaN,
+        priority: 0, points: NaN, every: 1, lastFrame: latest, predR: tracker.R.slice(), predT: tracker.t.slice(),
+      };
       this.slots.push(s);
       this.pendingFound.push(res.target);
+      this.lostAt.delete(res.target);
     }
     s.status = 'tracking';
+    s.lastFrame = latest;
     s.lastSeen = this.ringTime[this.ringSlot(latest)];
     return isNew ? res.target : null;
   }
@@ -591,7 +745,8 @@ export class Pipeline {
     const posStd = Math.sqrt(this.cov6[21] + this.cov6[28] + this.cov6[35]);
     const cov = Math.max(0, 1 - posStd / this.o.maxPosStd);
     const age = s.status === 'tracking' ? 1 : Math.max(0, 1 - (tCam - s.lastSeen) / this.o.coastTimeout);
-    const inl = s.status === 'tracking' ? Math.min(1, s.tracker.inliers / 30) : 1;
+    // Relative to the points the budget allows (a target kept at its floor is not less certain for it).
+    const inl = s.status === 'tracking' ? Math.min(1, s.tracker.inliers / Math.min(30, 0.8 * s.tracker.load.maxPoints)) : 1;
     return cov * age * inl;
   }
 

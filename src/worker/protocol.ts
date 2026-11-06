@@ -6,6 +6,7 @@ import type { EskfOptions } from '../fusion/eskf';
 import type { TrackerOptions } from '../track/tracker';
 import type { AcquireTime } from '../track/acquire';
 import type { SurfaceOptions } from '../deform/surface-tracker';
+import type { BudgetOptions } from '../track/budget';
 
 export interface TrackerInit {
   type: 'init';
@@ -28,6 +29,10 @@ export interface TrackerInit {
   /** Targets tracked as bending surfaces, and their mesh options. */
   deformable?: number[];
   surface?: Partial<SurfaceOptions>;
+  /** Tracking time per frame and how it is shared among targets. */
+  budget?: Partial<BudgetOptions>;
+  /** Matching time per acquisition pass (ms, after feature extraction). */
+  acquireBudgetMs?: number;
 }
 
 export interface AcquireInit {
@@ -45,7 +50,8 @@ export type ToTracker =
   | { type: 'stream'; readable: ReadableStream }
   | { type: 'imu'; samples: Float64Array }
   | { type: 'clock'; mediaTime: number; captureTime: number }
-  | { type: 'intrinsics'; K: Intrinsics };
+  | { type: 'intrinsics'; K: Intrinsics }
+  | { type: 'priority'; index: number; weight: number };
 
 export interface ResultMessage {
   type: 'result';
@@ -57,7 +63,11 @@ export interface ResultMessage {
   targets: FrameTargetInfo[];
   found: number[];
   lost: number[];
+  /** Targets the last acquisition nearly found (likely in view soon). */
+  near?: number[];
   timings: FrameTimings & { acquire?: number };
+  /** Tracking time allowed per frame (ms). */
+  budget: number;
   /** Filter snapshots for the render-side predictor (seconds, main clock). */
   snapshots: Array<{ index: number; snap: Float64Array }>;
   td: number;
@@ -97,7 +107,11 @@ export interface WireAcquireResult {
 }
 
 export type TrackerToAcquire =
-  | { type: 'acquire'; frameId: number; luma: ArrayBuffer; exclude: number[]; up: number[] | null }
+  | {
+    type: 'acquire'; frameId: number; luma: ArrayBuffer; exclude: number[]; up: number[] | null;
+    /** Most targets to return; targets to try first; matching time (ms); frame quads already taken. */
+    maxResults?: number; priority?: number[]; budgetMs?: number; occupied?: number[];
+  }
   | { type: 'intrinsics'; K: Intrinsics };
 
-export type AcquireToTracker = { type: 'acquired'; frameId: number; result: WireAcquireResult | null; ms: number };
+export type AcquireToTracker = { type: 'acquired'; frameId: number; results: WireAcquireResult[]; near: number[]; ms: number };

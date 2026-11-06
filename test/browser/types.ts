@@ -37,7 +37,8 @@ export interface StatsSample {
   acquireReady: boolean;
   td: number;
   tdCalibrated: boolean;
-  targets: Array<{ index: number; status: string; confidence: number; inliers: number; rms: number }>;
+  budgetMs: number;
+  targets: Array<{ index: number; status: string; confidence: number; inliers: number; rms: number; priority?: number; points?: number; every?: number }>;
 }
 
 export interface Diagnostics {
@@ -63,7 +64,8 @@ export interface HarnessResult {
   startedAt: number;
   endedAt: number;
   frames: FrameSample[];
-  events: { found: number[]; lost: number[] };
+  /** Target event times (performance.now()), and the indices found in order. */
+  events: { found: number[]; lost: number[]; near?: number[]; foundIndex?: number[] };
   stats: StatsSample | null;
   diagnostics: Diagnostics;
   /** Console errors/warnings, which is where worker failures surface. */
@@ -93,6 +95,8 @@ export interface TruthFrame {
   videoTime: number | null;
   /** Bent sheets: SURFACE_GRID points in camera coordinates (OpenCV, m), [x, y, z] each. */
   surface?: number[];
+  /** Several targets: each one's pose, and how much of it is in view (0 to 1). R and tv above are target 0's. */
+  targets?: Array<{ R: number[]; tv: number[]; inView: number }>;
 }
 
 export interface Truth {

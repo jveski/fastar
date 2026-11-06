@@ -215,6 +215,69 @@ export interface ImuSample {
   accel: Float64Array; // m/s^2 specific force, camera axes
 }
 
+/** Several targets on the wall (each its own poster or screen), one camera. */
+export interface MultiScenario {
+  name: string;
+  duration: number;
+  camera: (t: number) => RigidPose;
+  /** World poses of the targets (plane frames, as Scenario.target). */
+  targets: Array<(t: number) => RigidPose>;
+}
+
+export interface SimPoster {
+  texture: GrayImage;
+  widthM: number;
+  /** A screen playing a clip: its picture at scene time t. */
+  textureAt?: (t: number) => GrayImage;
+}
+
+/** Camera `dist` in front of the wall point (x, z), looking straight at it. */
+function facing(x: number, z: number, dist: number): RigidPose {
+  const eye = [x, -dist, z];
+  return pose(lookAt(eye, [x, 0, z]), eye);
+}
+
+const onWall = (x: number, z: number) => (): RigidPose => pose(WALL_R, [x, 0, z]);
+
+export const multiScenarios = {
+  /**
+   * `n` targets in a row on the wall, `spacing` m apart (centre to
+   * centre); the camera pans from the first to the last and back, so
+   * targets come into view and leave it.
+   */
+  gallery: (n = 3, spacing = 0.32, dist = 0.4, duration = 6): MultiScenario => {
+    const x0 = (-(n - 1) * spacing) / 2, x1 = -x0;
+    return {
+      name: `gallery-${n}`,
+      duration,
+      camera: (t) => facing(x0 + (x1 - x0) * (0.5 - 0.5 * Math.cos((2 * Math.PI * t) / duration)), 0.005 * Math.sin(1.3 * t), dist),
+      targets: Array.from({ length: n }, (_, i) => onWall(x0 + i * spacing, 0)),
+    };
+  },
+  /**
+   * cols x rows targets on the wall, all in view, the camera drifting a
+   * little in front of the point (fx, fz) (by default the grid's centre).
+   */
+  grid: (cols = 2, rows = 2, sx = 0.24, sz = 0.19, dist = 0.6, duration = 3, fx = 0, fz = 0): MultiScenario => ({
+    name: `grid-${cols}x${rows}`,
+    duration,
+    camera: (t) => facing(fx + 0.01 * Math.sin(1.1 * t), fz + 0.008 * Math.sin(0.8 * t), dist + 0.01 * Math.sin(0.6 * t)),
+    targets: Array.from({ length: cols * rows }, (_, k) => onWall(((k % cols) - (cols - 1) / 2) * sx, (((rows - 1) / 2) - Math.floor(k / cols)) * sz)),
+  }),
+};
+
+/** Wall and every target of a multi-target scenario. */
+export function createMultiSceneRenderer(scn: MultiScenario, K: Intrinsics, posters: SimPoster[], seed = 1): Renderer {
+  const wall = makeBackground(512, seed + 100);
+  const planes: TexturedPlane[] = [
+    { pose: () => pose(WALL_R, [0, 0.002, 0]), texture: wall, metersPerTexel: 0.002, tile: true },
+    ...posters.map((p, i): TexturedPlane => ({
+      pose: scn.targets[i], texture: p.texture, textureAt: p.textureAt, metersPerTexel: p.widthM / p.texture.width,
+    })),
+  ];
+  return new Renderer(K, planes, seed);
+}
+
 export interface ImuSimOptions {
   rate?: number;
   gyroBias?: [number, number, number];

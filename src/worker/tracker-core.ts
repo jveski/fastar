@@ -17,6 +17,11 @@ export interface PortLike {
 
 type Post = (msg: FromTracker, transfer?: Transferable[]) => void;
 
+/** Matching time per acquisition pass (ms): a few targets on a phone, all of a handful on a laptop. */
+export const DEFAULT_ACQUIRE_BUDGET = 20;
+/** Seconds a near miss keeps its target first in line for acquisition. */
+const NEAR_KEEP = 2;
+
 export class TrackerCore {
   pipeline: Pipeline | null = null;
   targets: TargetData[] = [];
@@ -33,6 +38,9 @@ export class TrackerCore {
   private mediaOffset = NaN;
   private arrivalOffset = Infinity;
   private focal: FocalCalibrator | null = null;
+  private acquireBudgetMs = DEFAULT_ACQUIRE_BUDGET;
+  /** Near misses from acquisition: target -> camera time (s). */
+  private readonly near = new Map<number, number>();
 
   constructor(private readonly post: Post, private readonly now: () => number = () => performance.now()) {}
 
@@ -48,6 +56,9 @@ export class TrackerCore {
           this.pipeline?.setIntrinsics(msg.K);
           this.acq?.postMessage({ type: 'intrinsics', K: msg.K } satisfies TrackerToAcquire);
           return;
+        case 'priority':
+          this.pipeline?.setPriority(msg.index, msg.weight);
+          return;
       }
     } catch (e) {
       this.post({ type: 'error', message: (e as Error).message ?? String(e) });
@@ -61,8 +72,9 @@ export class TrackerCore {
     this.clockOffset = (typeof performance !== 'undefined' ? performance.timeOrigin : 0) - m.mainTimeOrigin;
     const p = new Pipeline(this.targets, m.K, {
       width: m.width, height: m.height, maxTrack: m.maxTrack, useImu: m.useImu, eskf: m.eskf, tracker: m.tracker,
-      deformable: m.deformable, surface: m.surface,
+      deformable: m.deformable, surface: m.surface, budget: m.budget,
     });
+    if (m.acquireBudgetMs !== undefined) this.acquireBudgetMs = m.acquireBudgetMs;
     if (m.axisSigns) p.axisSigns.set(m.axisSigns);
     if (m.td !== undefined) p.setTd(m.td, !!m.tdCalibrated);
     this.reportedCalibration = !!m.tdCalibrated;
@@ -97,8 +109,11 @@ export class TrackerCore {
       this.acqBusy = true;
       p.markAcquire(res.frameId);
       const up = p.o.useImu ? p.upVector() : null;
+      const tracking = p.slots.filter((s) => s.status === 'tracking').length;
       this.acq.postMessage({
         type: 'acquire', frameId: res.frameId, luma: copy, exclude: p.trackedIndices(), up: up ? Array.from(up) : null,
+        maxResults: Math.max(1, p.o.maxTrack - tracking), priority: this.acquirePriority(res.time), budgetMs: this.acquireBudgetMs,
+        occupied: p.trackedQuads(),
       } satisfies TrackerToAcquire, [copy]);
     }
     if (this.focal) this.collectFocal();
@@ -126,31 +141,51 @@ export class TrackerCore {
   ): ResultMessage {
     const p = this.pipeline!;
     return {
-      type: 'result', frameId, t, doneAt: this.now() + this.clockOffset, targets, found, lost, timings,
+      type: 'result', frameId, t, doneAt: this.now() + this.clockOffset, targets, found, lost, timings, budget: p.budgetMs,
       snapshots: p.slots.map((s) => ({ index: s.index, snap: s.eskf.exportSnapshot(s.eskf.t - 0.4) })),
       td: p.td, tdCalibrated: p.tdCalibrated, clocks: p.clockStates(),
     };
+  }
+
+  /** Targets to try first when acquiring: recent near misses, then recently lost ones. */
+  private acquirePriority(tCam: number): number[] {
+    const out: number[] = [];
+    for (const [i, t] of this.near) {
+      if (tCam - t > NEAR_KEEP) this.near.delete(i);
+      else out.push(i);
+    }
+    for (const i of this.pipeline!.recentlyLost()) if (!out.includes(i)) out.push(i);
+    return out;
   }
 
   private onAcquired(m: AcquireToTracker): void {
     this.acqBusy = false;
     this.lastAcqMs = m.ms;
     const p = this.pipeline;
-    if (!p || !m.result) return;
-    const r = m.result;
-    const res: AcquireResult = { ...r, timings: { features: 0, match: 0, total: m.ms } };
-    const found = p.applyAcquisition(res, m.frameId);
-    if (found !== null) {
+    if (!p) return;
+    const tFrame = p.frameTime(m.frameId);
+    for (const i of m.near) this.near.set(i, Number.isNaN(tFrame) ? p.frameTime(p.latestFrameId) : tFrame);
+    const found: number[] = [];
+    for (const r of m.results) {
+      const res: AcquireResult = { ...r, timings: { features: 0, match: 0, total: m.ms } };
+      const f = p.applyAcquisition(res, m.frameId);
+      if (f === null) continue;
+      found.push(f);
+      this.near.delete(f);
       if (!p.o.deformable?.includes(r.target)) this.focal?.addHomography(r.H, this.targets[r.target]);
-      // Report immediately so rendering can start before the next frame.
-      const lid = p.latestFrameId;
-      const slot = p.slot(found)!;
-      const msg = this.buildResult(lid, p.frameTime(lid) * 1000, [{
-        index: found, status: slot.status, confidence: 1, inliers: slot.tracker.inliers, rms: slot.tracker.rms, nis: NaN,
-      }], [], [], { pyramid: 0, track: 0, fusion: 0, total: 0, klt: 0, ncc: 0, solve: 0, acquire: m.ms });
-      msg.acquisition = true;
-      this.post(msg, msg.snapshots.map((s) => s.snap.buffer as ArrayBuffer));
     }
+    const near = m.near.filter((i) => !p.slot(i));
+    if (!found.length && !near.length) return;
+    // Report immediately so rendering (or loading content) can start before the next frame.
+    const lid = p.latestFrameId;
+    const targets = found.map((i) => {
+      const slot = p.slot(i)!;
+      return { index: i, status: slot.status, confidence: 1, inliers: slot.tracker.inliers, rms: slot.tracker.rms, nis: NaN };
+    });
+    const msg = this.buildResult(lid, p.frameTime(lid) * 1000, targets, [], [], { pyramid: 0, track: 0, fusion: 0, total: 0, klt: 0, ncc: 0, solve: 0, acquire: m.ms });
+    msg.acquisition = true;
+    if (near.length) msg.near = near;
+    this.post(msg, msg.snapshots.map((s) => s.snap.buffer as ArrayBuffer));
   }
 
   private collectFocal(): void {

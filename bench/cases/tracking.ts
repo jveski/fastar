@@ -1,7 +1,7 @@
 import type { BenchCase } from '../harness';
 import { intrinsicsFromFov } from '../../src/vision/camera';
 import { makePoster } from '../../src/sim/poster';
-import { createSceneRenderer, scenarios } from '../../src/sim/scene';
+import { createMultiSceneRenderer, createSceneRenderer, multiScenarios, scenarios } from '../../src/sim/scene';
 import { targetFor } from '../../src/sim/harness';
 import { Acquirer } from '../../src/track/acquire';
 import { Pipeline } from '../../src/track/pipeline';
@@ -94,6 +94,7 @@ export function trackingCases(): BenchCase[] {
         };
       },
     },
+    ...multiTrackingCases(K),
     {
       name: 'ESKF update + re-propagation (100 ms delay)',
       budgetMs: 0.3 / 3,
@@ -120,5 +121,36 @@ export function trackingCases(): BenchCase[] {
         };
       },
     },
+  ];
+}
+
+/**
+ * Four posters in view: at full resolution, all of them fit the default
+ * budget here; with a tight budget (a slow phone) the frame stays bounded.
+ */
+function multiTrackingCases(K: ReturnType<typeof intrinsicsFromFov>): BenchCase[] {
+  const posters = [11, 23, 37, 41].map((s) => ({ texture: makePoster(640, 480, s), widthM: 0.2 }));
+  const targets = posters.map((p) => targetFor(p.texture, p.widthM));
+  const scn = multiScenarios.grid(2, 2, 0.24, 0.19, 0.6, 3, -0.08, 0.06);
+  const r = createMultiSceneRenderer(scn, K, posters);
+  const fwd = Array.from({ length: 31 }, (_, k) => r.render(k / 30, scn.camera, { noise: 2 }).data);
+  const seq = [...fwd, ...fwd.slice(1, -1).reverse()];
+  const make = (trackMs?: number) => () => {
+    const p = new Pipeline(targets, K, { width: 640, height: 480, maxTrack: 4, budget: trackMs ? { budgetMs: trackMs } : undefined });
+    const acq = new Acquirer(targets, 640, 480, K);
+    const res = p.processFrame(seq[0], 0);
+    for (const a of acq.acquireAll(seq[0], { maxResults: 4 }).results) p.applyAcquisition(a, res.frameId);
+    if (p.slots.length !== 4) throw new Error('no lock on all four');
+    let k = 0, t = 0;
+    return () => {
+      k = (k + 1) % seq.length;
+      t += 1 / 30;
+      const fr = p.processFrame(seq[k], t);
+      if (fr.targets.length !== 4 || fr.targets.some((x) => x.status !== 'tracking')) throw new Error('lost track in benchmark');
+    };
+  };
+  return [
+    { name: 'tracking path per frame, 4 targets in view', budgetMs: 8, iterations: 200, warmup: 60, setup: make() },
+    { name: 'tracking path per frame, 4 targets in view, 2 ms tracking budget', budgetMs: 3, iterations: 200, warmup: 60, setup: make(2) },
   ];
 }

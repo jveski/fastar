@@ -45,6 +45,8 @@ const runOverride = Number(p.get('runMs') ?? 0);
 const targetFile = p.get('target') ?? 'targets-image.bin';
 const deformable = p.get('deformable') === '1';
 const useTruth = p.get('truth') !== '0';
+// Tracking time per frame (ms), to exercise the budget.
+const trackMs = Number(p.get('trackMs') ?? 0) || undefined;
 // Slow devices can play the clip slower to give acquisition more wall time;
 // truth is keyed by mediaTime, so the comparison is unchanged.
 const playbackRate = Number(p.get('rate') ?? 1);
@@ -145,16 +147,18 @@ function snapshot(ar: ImageTracker): StatsSample {
   return {
     path: s.path, sensors: s.sensors, motionPermission: s.motionPermission,
     imuSamples: s.imuSamples, fps: s.fps, latency: s.latency,
-    trackerReady: s.trackerReady, acquireReady: s.acquireReady, td: s.td, tdCalibrated: s.tdCalibrated,
+    trackerReady: s.trackerReady, acquireReady: s.acquireReady, td: s.td, tdCalibrated: s.tdCalibrated, budgetMs: s.budgetMs,
     targets: s.targets.map((t) => ({
       index: t.index, status: t.status, confidence: t.confidence, inliers: t.inliers, rms: t.rms,
+      priority: t.priority, points: t.points, every: t.every,
     })),
   };
 }
 
 function attach(ar: ImageTracker, frames: FrameSample[], events: HarnessResult['events']): void {
-  ar.on('found', () => events.found.push(performance.now()));
+  ar.on('found', (i) => { events.found.push(performance.now()); (events.foundIndex ??= []).push(i); });
   ar.on('lost', () => events.lost.push(performance.now()));
+  ar.on('near', (i) => (events.near ??= []).push(i));
   ar.onFrame((e: FrameEvent) => {
     const poses: PoseSample[] = [];
     for (const [index, pose] of e.poses) {
@@ -254,7 +258,7 @@ function sessionMs(log: SessionLog): number {
 
 async function startReplay(log: SessionLog, ms: number): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable, budget: trackMs ? { trackMs } : undefined });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -278,7 +282,7 @@ async function startReplay(log: SessionLog, ms: number): Promise<void> {
 
 async function startLive(): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable, budget: trackMs ? { trackMs } : undefined });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -312,7 +316,7 @@ async function startLive(): Promise<void> {
 
 async function startRecord(): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable, budget: trackMs ? { trackMs } : undefined });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -331,7 +335,7 @@ async function startRecord(): Promise<void> {
   if (!session.video) throw new Error('MediaRecorder produced no video');
 
   const blobUrl = URL.createObjectURL(session.video);
-  const ar2 = await ImageTracker.create({ targets: fixture(targetFile), deformable });
+  const ar2 = await ImageTracker.create({ targets: fixture(targetFile), deformable, budget: trackMs ? { trackMs } : undefined });
   const frames2: FrameSample[] = [];
   const events2: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar2, frames2, events2);

@@ -189,6 +189,9 @@ export class TargetTracker {
   starved = false;
   private replTried = 0;
   private replFound = 0;
+  /** Per-frame work limits, set by the tracking budget (setLoad); the options by default. */
+  readonly load: Pick<TrackerOptions, 'maxPoints' | 'nccPerFrame' | 'replenishAttempts'>;
+  private readonly wsort: Float64Array;
 
   constructor(readonly target: TargetData, public K: Intrinsics, opts: Partial<TrackerOptions> = {}) {
     this.o = { ...DEFAULT_TRACKER, ...opts };
@@ -229,6 +232,17 @@ export class TargetTracker {
     this.cObj = new Float32Array(2 * Math.max(cap, COARSE_ATTEMPTS));
     this.cImg = new Float32Array(2 * Math.max(cap, COARSE_ATTEMPTS));
     this.cNorm = new Float64Array(2 * Math.max(cap, COARSE_ATTEMPTS));
+    this.wsort = new Float64Array(cap);
+    this.load = { maxPoints: this.o.maxPoints, nccPerFrame: this.o.nccPerFrame, replenishAttempts: this.o.replenishAttempts };
+  }
+
+  /**
+   * Work on up to `points` active points per frame (at most the maxPoints
+   * option), with drift correction and replenishing scaled to match.
+   * Points beyond it are dropped at the next pose solve, weakest first.
+   */
+  setLoad(points: number): void {
+    setLoad(this.o, this.load, points);
   }
 
   reset(): void {
@@ -293,7 +307,7 @@ export class TargetTracker {
     // Video: the pose may be well off (an acquisition matched against a
     // keyframe whose content has moved on since); line it up coarsely first.
     if (this.video) this.coarseAlign(frame, this.R, this.t);
-    this.replenish(frame.levels[0], maxAttempts, this.o.maxPoints);
+    this.replenish(frame.levels[0], maxAttempts, this.load.maxPoints);
     if (this.n < minPoints) { this.reset(); return false; }
     this.ok = this.solve(this.R, this.t);
     if (this.ok) this.removeOutliers();
@@ -354,7 +368,8 @@ export class TargetTracker {
     tm.solve += t0 - t1;
     // 4. Replenish lost points from the target's tracking points.
     this.replTried = this.replFound = 0;
-    if (this.n < o.maxPoints) this.replenish(cur.levels[0], o.replenishAttempts, o.maxPoints);
+    const L = this.load;
+    if (this.n < L.maxPoints) this.replenish(cur.levels[0], L.replenishAttempts, L.maxPoints);
     if (this.video) this.checkAlignment();
     tm.replenish = now() - t0;
     if (this.inliers < o.minInliers) return this.fail();
@@ -371,8 +386,7 @@ export class TargetTracker {
    * caller to search the time and pose again (see searchTime).
    */
   private checkAlignment(): void {
-    const o = this.o;
-    const starved = this.n < 0.5 * o.maxPoints && this.replTried >= 10 && this.replFound < 0.25 * this.replTried;
+    const starved = this.n < 0.5 * this.load.maxPoints && this.replTried >= 10 && this.replFound < 0.25 * this.replTried;
     this.doubt = starved ? this.doubt + 1 : 0;
     this.starved = this.doubt >= DOUBT_FRAMES;
     if (this.starved) this.doubt = 0;
@@ -597,15 +611,17 @@ export class TargetTracker {
 
   private removeOutliers(): void {
     const w = this.solver.weights;
+    const keep = keepMask(w, this.n, this.load.maxPoints, this.wsort);
     let m = 0;
     for (let i = 0; i < this.n; i++) {
-      if (w[i] <= 0) { this.active[this.idx[i]] = 0; continue; }
+      if (!keep(i)) { this.active[this.idx[i]] = 0; continue; }
       this.idx[m] = this.idx[i];
       this.pos[2 * m] = this.pos[2 * i];
       this.pos[2 * m + 1] = this.pos[2 * i + 1];
       m++;
     }
     this.n = m;
+    if (this.inliers > m) this.inliers = m;
   }
 
   /** Pick the target image whose pixels are closest to one frame pixel. */
@@ -852,7 +868,7 @@ export class TargetTracker {
     if (n === 0) return 0;
     const k = this.pickImage();
     if (!this.setupWarp(k)) return 0;
-    const cnt = Math.min(this.o.nccPerFrame, n);
+    const cnt = Math.min(this.load.nccPerFrame, n);
     let corrected = 0;
     const drop = this.status; // reuse as a drop mask
     drop.fill(0, 0, n);
@@ -918,6 +934,31 @@ function project(K: Intrinsics, R: ArrayLike<number>, t: ArrayLike<number>, X: n
   out[o] = (K.fx * (R[0] * X + R[1] * Y + t[0])) / z + K.cx;
   out[o + 1] = (K.fy * (R[3] * X + R[4] * Y + t[1])) / z + K.cy;
   return true;
+}
+
+/** Fill a tracker's per-frame limits for `points` active points (shared with the bending tracker). */
+export function setLoad(o: TrackerOptions, load: Pick<TrackerOptions, 'maxPoints' | 'nccPerFrame' | 'replenishAttempts'>, points: number): void {
+  const p = Math.max(1, Math.min(o.maxPoints, Math.round(points)));
+  const f = p / o.maxPoints;
+  load.maxPoints = p;
+  load.nccPerFrame = Math.min(o.nccPerFrame, Math.max(8, Math.round(o.nccPerFrame * f)));
+  load.replenishAttempts = Math.min(o.replenishAttempts, Math.max(8, Math.round(o.replenishAttempts * f)));
+}
+
+/**
+ * Which of n points (robust solver weights w) to keep: those with weight
+ * > 0, and of those at most `cap`, the highest weights first.
+ */
+export function keepMask(w: ArrayLike<number>, n: number, cap: number, scratch: Float64Array): (i: number) => boolean {
+  let alive = 0;
+  for (let i = 0; i < n; i++) if (w[i] > 0) scratch[alive++] = w[i];
+  if (alive <= cap) return (i) => w[i] > 0;
+  const s = scratch.subarray(0, alive).sort().reverse();
+  const cut = s[cap - 1];
+  let above = 0;
+  for (let i = 0; i < alive; i++) if (s[i] > cut) above++;
+  let ties = cap - above;
+  return (i) => w[i] > cut || (w[i] === cut && w[i] > 0 && ties-- > 0);
 }
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());

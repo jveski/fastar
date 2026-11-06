@@ -41,12 +41,50 @@ export interface AcquireOptions {
   exclude?: ReadonlyArray<number>;
   /** Unit "up" direction (opposite gravity) in camera coordinates, if known. */
   up?: ArrayLike<number> | null;
+  /** Most targets to return from one frame (acquireAll; default 1). */
+  maxResults?: number;
+  /**
+   * Stop starting on further targets once matching has taken this long (ms,
+   * after feature extraction; at least one target is always tried). Targets
+   * not reached are tried first next time.
+   */
+  budgetMs?: number;
+  /** Targets to try before the others (e.g. recently seen), most likely first. */
+  priority?: ReadonlyArray<number>;
+  /**
+   * Frame regions already taken (e.g. by tracked targets): quads of 4 frame
+   * points [x0, y0, ..., x3, y3] each, flattened. Matches inside them are
+   * not accepted.
+   */
+  occupied?: ArrayLike<number>;
+}
+
+/** All the targets found in one frame. */
+export interface AcquireBatch {
+  results: AcquireResult[];
+  /**
+   * Near misses: targets whose features lined up with the frame in a
+   * consistent way, but too weakly to accept (far away, blurred, coming
+   * into view). Likely to be found soon.
+   */
+  near: number[];
+  /** Targets tried, in order. */
+  tried: number[];
+  timings: { features: number; match: number; total: number };
 }
 
 const LEVEL_POINTS = [400, 300, 200, 100];
 const RATIO = 0.7;
 const MAX_DIST = 80;
 const MIN_INLIERS = 12;
+/**
+ * A Hough cluster this large (features agreeing on where the target is, how
+ * big and how turned) whose verification then failed makes a near miss.
+ * Frames without the target rarely reach 3.
+ */
+const NEAR_HOUGH = 5;
+/** A candidate with more than this share of its inliers inside a taken region is a duplicate. */
+const OVERLAP = 0.5;
 
 export class Acquirer {
   readonly features = new FeatureSet(2048);
@@ -69,6 +107,12 @@ export class Acquirer {
   private readonly allQuality = new Float32Array(4096);
   /** Per-level FAST thresholds, adapted toward 3-10x the needed corner count. */
   readonly thresholds = new Int32Array([20, 20, 20, 20]);
+  /** Round-robin position over the targets, for budgeted passes. */
+  private cursor = 0;
+  /** A target the last (budgeted) pass did not reach, tried first next time; -1 if none. */
+  private carry = -1;
+  /** How far the last matchTarget got: ratio-test matches, largest Hough cluster, homography inliers. */
+  readonly evidence = { matches: 0, hough: 0, homography: 0 };
 
   constructor(readonly targets: TargetData[], readonly width: number, readonly height: number, public K: Intrinsics) {
     this.pyr = new Pyramid(width, height, 4);
@@ -101,22 +145,73 @@ export class Acquirer {
     return f;
   }
 
+  /** The best match in the frame over all targets (not excluded), or null. */
   acquire(luma: Uint8Array, o: AcquireOptions = {}): AcquireResult | null {
-    const t0 = now();
-    this.extract(luma);
-    const t1 = now();
-    let best: AcquireResult | null = null;
-    for (let ti = 0; ti < this.targets.length; ti++) {
-      if (o.exclude?.includes(ti)) continue;
-      const r = this.matchTarget(ti, o);
-      if (r && (!best || r.inliers > best.inliers)) best = r;
-    }
-    const t2 = now();
-    if (best) best.timings = { features: t1 - t0, match: t2 - t1, total: t2 - t0 };
+    const b = this.acquireAll(luma, { ...o, maxResults: 1, budgetMs: undefined });
+    const best = b.results[0] ?? null;
+    if (best) best.timings = b.timings;
     return best;
   }
 
+  /**
+   * Every target found in the frame (up to o.maxResults), best first, and
+   * the near misses. Targets are tried in priority order, then round-robin,
+   * until o.budgetMs runs out. Candidates matching the same part of the
+   * frame as a better one (or an occupied region) are dropped.
+   */
+  acquireAll(luma: Uint8Array, o: AcquireOptions = {}): AcquireBatch {
+    const t0 = now();
+    this.extract(luma);
+    const t1 = now();
+    const order = this.order(o);
+    const cands: AcquireResult[] = [], near: number[] = [], tried: number[] = [];
+    let lastRoundRobin = -1;
+    for (const ti of order) {
+      if (tried.length > 0 && o.budgetMs !== undefined && now() - t1 >= o.budgetMs) break;
+      tried.push(ti);
+      if (!o.priority?.includes(ti)) lastRoundRobin = ti;
+      const r = this.matchTarget(ti, o);
+      if (r) cands.push(r);
+      else if (this.evidence.hough >= NEAR_HOUGH) near.push(ti);
+    }
+    if (lastRoundRobin >= 0) this.cursor = (lastRoundRobin + 1) % Math.max(1, this.targets.length);
+    // A pass the budget let reach only targets tried ahead of the round-robin: the first it did not
+    // reach goes first next time, so no target starves behind others.
+    this.carry = lastRoundRobin < 0 ? order.find((ti) => !tried.includes(ti)) ?? -1 : -1;
+    cands.sort((a, b) => b.inliers - a.inliers);
+    const taken: number[][] = [];
+    const occ = o.occupied;
+    if (occ) for (let k = 0; k + 8 <= occ.length; k += 8) taken.push(Array.from({ length: 8 }, (_, i) => occ[k + i]));
+    const results: AcquireResult[] = [];
+    const maxResults = o.maxResults ?? 1;
+    for (const c of cands) {
+      if (results.length >= maxResults) break;
+      if (overlapShare(c.frame, taken) > OVERLAP) continue;
+      results.push(c);
+      taken.push(targetQuad(this.targets[c.target], c.H));
+    }
+    const t2 = now();
+    const timings = { features: t1 - t0, match: t2 - t1, total: t2 - t0 };
+    for (const r of results) r.timings = timings;
+    return { results, near, tried, timings };
+  }
+
+  /** Targets to try: one the last pass did not reach, then priority, then the rest round-robin from the cursor. */
+  private order(o: AcquireOptions): number[] {
+    const n = this.targets.length, out: number[] = [];
+    const ok = (ti: number) => ti >= 0 && ti < n && !o.exclude?.includes(ti) && !out.includes(ti);
+    if (ok(this.carry)) out.push(this.carry);
+    for (const ti of o.priority ?? []) if (ok(ti)) out.push(ti);
+    for (let k = 0; k < n; k++) {
+      const ti = (this.cursor + k) % n;
+      if (ok(ti)) out.push(ti);
+    }
+    return out;
+  }
+
   matchTarget(ti: number, o: AcquireOptions = {}): AcquireResult | null {
+    const ev = this.evidence;
+    ev.matches = ev.hough = ev.homography = 0;
     const T = this.targets[ti];
     const f = this.features;
     const fdesc = f.desc;
@@ -136,6 +231,7 @@ export class Acquirer {
       mq[nm] = q; mt[nm] = b; mquality[nm] = d1 / Math.max(1, d2);
       nm++;
     }
+    ev.matches = nm;
     if (nm < MIN_INLIERS) return null;
     if (T.video) return this.matchVideo(ti, T, nm, o);
     return this.fromMatches(ti, T, nm, o, -1);
@@ -223,6 +319,8 @@ export class Acquirer {
     if (nm < MIN_INLIERS) return null;
     // 2. Hough vote on (centre x, centre y, angle, log-scale).
     const sel = this.hough(T, nm);
+    const ev = this.evidence;
+    if (sel.length > ev.hough) ev.hough = sel.length;
     if (sel.length < 6) return null;
     sel.sort((a, b) => mquality[a] - mquality[b]);
     const src = new Float32Array(2 * sel.length), dst = new Float32Array(2 * sel.length);
@@ -234,6 +332,7 @@ export class Acquirer {
     const H = new Float64Array(9);
     const mask = new Uint8Array(sel.length);
     const inl = prosacHomography(src, dst, sel.length, H, mask, this.rng, { maxIter: 300, threshold: 5, confidence: 0.995 });
+    if (inl > ev.homography) ev.homography = inl;
     if (inl < 6) return null;
     // 4. Guided matching with the homography.
     const g = this.guided(T, H, keyframe);
@@ -426,6 +525,38 @@ function cellOf(kp: Float32Array, q: number, cell: number, gw: number, gh: numbe
   const cx = Math.min(gw - 1, Math.max(0, Math.floor(kp[4 * q] / cell)));
   const cy = Math.min(gh - 1, Math.max(0, Math.floor(kp[4 * q + 1] / cell)));
   return cy * gw + cx;
+}
+
+/** Frame quad [x0, y0, ..., x3, y3] of target T's corners under H (base px -> frame px). */
+export function targetQuad(T: TargetData, H: ArrayLike<number>): number[] {
+  const w = T.meta.width - 1, h = T.meta.height - 1, p = new Float64Array(2), out: number[] = [];
+  for (const [u, v] of [[0, 0], [w, 0], [w, h], [0, h]]) {
+    applyH(H, u, v, p);
+    out.push(p[0], p[1]);
+  }
+  return out;
+}
+
+/** Share of the points [x, y, ...] lying inside any of the quads. */
+export function overlapShare(pts: ArrayLike<number>, quads: number[][]): number {
+  const n = pts.length >> 1;
+  if (!n || !quads.length) return 0;
+  let inside = 0;
+  for (let i = 0; i < n; i++) {
+    const x = pts[2 * i], y = pts[2 * i + 1];
+    if (quads.some((q) => inPolygon(q, x, y))) inside++;
+  }
+  return inside / n;
+}
+
+function inPolygon(q: ArrayLike<number>, x: number, y: number): boolean {
+  const n = q.length >> 1;
+  let c = false;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = q[2 * i], yi = q[2 * i + 1], xj = q[2 * j], yj = q[2 * j + 1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+  }
+  return c;
 }
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());

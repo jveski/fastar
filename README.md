@@ -53,3 +53,26 @@ ar.onFrame(({ poses }) => {
 `surface.positions` holds the mesh itself (`cols` x `rows` vertices from the top-left corner), and `surface.fillGrid()` fills render geometry at any resolution. With three.js, `three.surface(0, { material })` adds a mesh that follows the page, textured like the target image. `deformable: { targets, grid, smoothing }` chooses which targets bend, the mesh resolution (vertices along the long side, default 9) and how much small shape changes are eased.
 
 Find the page while it is roughly flat, then bend it. Smooth bends work; creases and folds don't, and video targets are always rigid. The page needs detail all over: every part of it must be tracked to be shaped.
+
+## Several targets
+
+Compile several images or videos into one file and every one of them is tracked, all at once. `poses` holds each target in view by its index, in the order they were compiled; `ar.targetIndex(name)` looks one up by name. [Example](examples/multi) (four videos on one screen)
+
+```sh
+npx fastar-compile -o targets.bin poster.png:0.42 cover.jpg:0.21 loop.mp4:1.2
+```
+
+Each target's content can be loaded only when it is needed: when the target is found, or nearly found as it comes into view (the `near` event). Content out of view for a while is unloaded to make room. How much stays loaded follows the device (`budget: 'auto'`): more on fast phones and computers, less on slow ones, and less still while the frame rate suffers.
+
+```js
+const ar = await ImageTracker.create({ targets: './targets.bin' });
+const three = new ThreeAdapter(ar, { THREE, scene, camera, content: { budget: 'auto', keepAlive: 5000 } });
+ar.targets.forEach((t, i) => three.content(i, async ({ signal, name }) => {
+  const gltf = await loader.loadAsync(`./models/${name}.glb`); // added to target i's anchor once loaded
+  return gltf.scene;                                           // removed and disposed once unloaded
+}));
+```
+
+Without three.js, `ar.content({ load, unload, show, hide })` does the same for anything, and in A-Frame `fastar-content="src: model.glb"` (or a video) on a `fastar-target` entity loads it only once that target is found.
+
+The time spent tracking per camera frame is bounded (`budget: { trackMs }`, by default 60% of the frame interval), so a slow phone does not fall behind as targets come into view. Every target in view is still tracked: the most prominent ones (largest, wholly in view, nearest the centre) keep full resolution, and the others are tracked with fewer points, or on fewer frames, when time runs short. `ar.setPriority(index, weight)` favours a target, and `ar.stats.targets` shows each target's priority, points and update rate. `maxTrack` limits how many targets are tracked at once.

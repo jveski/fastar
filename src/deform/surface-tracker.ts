@@ -18,6 +18,7 @@ import { DEFAULT_TRACKER, type TrackerOptions, type TrackTimings } from '../trac
 import { SurfaceMesh } from './mesh';
 import { SurfaceSolver, type SurfaceSolverOptions } from './solver';
 import { sampleGrid } from './grid';
+import { keepMask, setLoad } from '../track/tracker';
 
 export interface SurfaceOptions {
   /** Mesh vertices along the target's long side (cells stay roughly square). */
@@ -117,6 +118,9 @@ export class SurfaceTracker {
   private nccCursor = 0;
   private replCursor = 0;
   private coarseCursor = 0;
+  /** Per-frame work limits, set by the tracking budget (setLoad); the options by default. */
+  readonly load: Pick<TrackerOptions, 'maxPoints' | 'nccPerFrame' | 'replenishAttempts'>;
+  private readonly wsort: Float64Array;
 
   constructor(readonly target: TargetData, public K: Intrinsics, opts: Partial<TrackerOptions> = {}, surface: Partial<SurfaceOptions> = {}) {
     if (target.video) throw new Error('fastar: video targets cannot be tracked as bending surfaces');
@@ -164,6 +168,18 @@ export class SurfaceTracker {
     this.cellCount = new Int32Array(this.mesh.faceCount >> 1);
     this.faceHinv = new Float64Array(9 * this.mesh.faceCount);
     this.faceOk = new Uint8Array(this.mesh.faceCount);
+    this.wsort = new Float64Array(cap);
+    this.load = { maxPoints: this.o.maxPoints, nccPerFrame: this.o.nccPerFrame, replenishAttempts: this.o.replenishAttempts };
+  }
+
+  /** Mesh cells (each wants a few points). */
+  get cells(): number {
+    return this.cellCount.length;
+  }
+
+  /** See TargetTracker.setLoad. */
+  setLoad(points: number): void {
+    setLoad(this.o, this.load, points);
   }
 
   reset(): void {
@@ -200,7 +216,7 @@ export class SurfaceTracker {
       if (m < minPoints) continue;
       this.fit(this.cIds, this.cImg, m, 2 * (1 << L), stiff, INIT_ITERATIONS);
     }
-    this.replenish(frame, maxAttempts, this.o.maxPoints, 0);
+    this.replenish(frame, maxAttempts, this.load.maxPoints, 0);
     if (this.n < minPoints) { this.reset(); return false; }
     this.ok = this.fit(this.idx, this.pos, this.n, 4, 1, INIT_ITERATIONS) && this.fit(this.idx, this.pos, this.n);
     if (this.ok) this.removeOutliers();
@@ -256,7 +272,8 @@ export class SurfaceTracker {
     t0 = now();
     tm.solve += t0 - t1;
     // 5. Replenish, filling the emptiest cells first.
-    if (this.n < o.maxPoints) this.replenish(cur, o.replenishAttempts, o.maxPoints, RESCUE_ATTEMPTS);
+    const L = this.load;
+    if (this.n < L.maxPoints) this.replenish(cur, L.replenishAttempts, L.maxPoints, RESCUE_ATTEMPTS);
     tm.replenish = now() - t0;
     if (this.inliers < o.minInliers) return this.fail();
     this.ok = true;
@@ -348,15 +365,17 @@ export class SurfaceTracker {
 
   private removeOutliers(): void {
     const w = this.pose.weights;
+    const keep = keepMask(w, this.n, this.load.maxPoints, this.wsort);
     let m = 0;
     for (let i = 0; i < this.n; i++) {
-      if (w[i] <= 0) { this.active[this.idx[i]] = 0; continue; }
+      if (!keep(i)) { this.active[this.idx[i]] = 0; continue; }
       this.idx[m] = this.idx[i];
       this.pos[2 * m] = this.pos[2 * i];
       this.pos[2 * m + 1] = this.pos[2 * i + 1];
       m++;
     }
     this.n = m;
+    if (this.inliers > m) this.inliers = m;
   }
 
   /** Target image whose pixels are closest to one frame pixel at pyramid scale sc. */
@@ -412,7 +431,7 @@ export class SurfaceTracker {
     if (n === 0) return 0;
     const k = this.pickImage();
     this.setupFaceWarps(k);
-    const cnt = Math.min(this.o.nccPerFrame, n);
+    const cnt = Math.min(this.load.nccPerFrame, n);
     let corrected = 0;
     const drop = this.status;
     drop.fill(0, 0, n);

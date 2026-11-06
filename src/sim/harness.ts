@@ -8,7 +8,11 @@ import type { VideoClip } from './motion';
 import type { TargetData } from '../target/format';
 import { Acquirer } from '../track/acquire';
 import { Pipeline, type PipelineOptions } from '../track/pipeline';
-import { createSceneRenderer, relativePose, sheetShape, simulateImu, type ImuSimOptions, type Scenario } from './scene';
+import { screenPriority } from '../track/budget';
+import {
+  createMultiSceneRenderer, createSceneRenderer, relativePose, sheetShape, simulateImu,
+  type ImuSimOptions, type MultiScenario, type Scenario, type SimPoster,
+} from './scene';
 import type { RenderOptions } from './renderer';
 import { mat3MulAtB, so3Log, mat3, vec3, rotationAngle } from '../math/rot';
 import { projectPoint } from '../vision/pose';
@@ -199,6 +203,123 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
 /** A tracker that estimates the target's shape: target-frame point of flat target point (X, Y). */
 interface SurfaceLike {
   surfacePoint?(X: number, Y: number, out: Float64Array): void;
+}
+
+export interface MultiRunOptions {
+  K: Intrinsics;
+  posters: SimPoster[];
+  /** Compiled targets, one per poster (compiled from them by default). */
+  targets?: TargetData[];
+  fps?: number;
+  useImu?: boolean;
+  imu?: ImuSimOptions;
+  render?: RenderOptions;
+  pipeline?: Partial<PipelineOptions>;
+  /** Matching time per acquisition pass (ms); unbounded by default. */
+  acquireBudgetMs?: number;
+}
+
+export interface MultiTargetLog {
+  /** How much of the target the camera sees (ground truth): see screenPriority. */
+  inView: number;
+  coverage: number;
+  visible: boolean;
+  status: string;
+  overlayErrPx: number;
+  points: number;
+  every: number;
+  priority: number;
+  /** Video targets: the estimated video time (s, NaN if none) and whether it is locked. */
+  videoTime: number;
+  videoLocked: boolean;
+}
+
+export interface MultiFrameLog {
+  t: number;
+  targets: MultiTargetLog[];
+  /** Pipeline time for the frame, tracking time, and the tracking budget (ms). */
+  totalMs: number;
+  trackMs: number;
+  budget: number;
+  /** Targets found by this frame's acquisition, and its near misses. */
+  acquired: number[];
+  near: number[];
+}
+
+export interface MultiRunResult {
+  frames: MultiFrameLog[];
+  /** Acquisition passes and the targets each tried. */
+  passes: number[][];
+  pipeline: Pipeline;
+}
+
+/**
+ * Run a multi-target scenario through the pipeline, acquiring every target
+ * it can each pass (as the acquisition worker does).
+ */
+export function runMultiScenario(scn: MultiScenario, o: MultiRunOptions): MultiRunResult {
+  const fps = o.fps ?? 30, K = o.K;
+  const targets = o.targets ?? o.posters.map((p) => targetFor(p.texture, p.widthM));
+  const renderer = createMultiSceneRenderer(scn, K, o.posters);
+  const pipeline = new Pipeline(targets, K, { width: K.width, height: K.height, useImu: !!o.useImu, maxTrack: targets.length, ...o.pipeline });
+  const acq = new Acquirer(targets, K.width, K.height, K);
+  const imu = o.useImu ? simulateImu({ ...scn, target: scn.targets[0] }, o.imu) : [];
+  let imuIdx = 0;
+  const frames: MultiFrameLog[] = [], passes: number[][] = [];
+  const estR = mat3(), estT = vec3(), pe = new Float32Array(2), pg = new Float32Array(2);
+  const corners = o.posters.map((p) => {
+    const hw = p.widthM / 2, hh = (p.widthM * p.texture.height) / p.texture.width / 2;
+    return [-hw, -hh, hw, -hh, hw, hh, -hw, hh];
+  });
+  const nFrames = Math.floor(scn.duration * fps);
+  for (let k = 0; k < nFrames; k++) {
+    const t = k / fps;
+    while (imuIdx < imu.length && imu[imuIdx].t <= t + 0.02) {
+      const s = imu[imuIdx++];
+      pipeline.pushImu(s.t, s.gyro[0], s.gyro[1], s.gyro[2], s.accel[0], s.accel[1], s.accel[2]);
+    }
+    const img = renderer.render(t, scn.camera, { noise: 2, ...o.render });
+    const res = pipeline.processFrame(img.data, t);
+    const acquired: number[] = [];
+    let near: number[] = [];
+    if (res.wantAcquire) {
+      pipeline.markAcquire(res.frameId);
+      const tracking = pipeline.slots.filter((s) => s.status === 'tracking').length;
+      const b = acq.acquireAll(img.data, {
+        exclude: pipeline.trackedIndices(), up: o.useImu ? pipeline.upVector() : null, maxResults: Math.max(1, pipeline.o.maxTrack - tracking),
+        priority: pipeline.recentlyLost(), budgetMs: o.acquireBudgetMs, occupied: pipeline.trackedQuads(),
+      });
+      passes.push(b.tried);
+      near = b.near;
+      for (const r of b.results) if (pipeline.applyAcquisition(r, res.frameId) !== null) acquired.push(r.target);
+    }
+    const per: MultiTargetLog[] = targets.map((T, i) => {
+      const gt = relativePose(scn.camera(t), scn.targets[i](t));
+      const m = T.meta, hw = m.physicalWidth / 2, hh = (m.physicalWidth * m.height) / m.width / 2;
+      const view = screenPriority(K, gt.R, gt.t, hw, hh);
+      const s = pipeline.slot(i);
+      const visible = !!s && pipeline.isVisible(s, t);
+      let overlay = NaN;
+      if (visible && pipeline.poseAt(i, t, estR, estT)) {
+        const c = corners[i];
+        let e = 0;
+        for (let q = 0; q < 4; q++) {
+          projectPoint(K, estR, estT, c[2 * q], c[2 * q + 1], pe);
+          projectPoint(K, gt.R, gt.t, c[2 * q], c[2 * q + 1], pg);
+          e += Math.hypot(pe[0] - pg[0], pe[1] - pg[1]);
+        }
+        overlay = e / 4;
+      }
+      const info = res.targets.find((x) => x.index === i);
+      return {
+        inView: view.inside, coverage: view.coverage, visible, status: s?.status ?? 'none', overlayErrPx: overlay,
+        points: s ? s.tracker.load.maxPoints : 0, every: s?.every ?? 0, priority: s?.priority ?? 0,
+        videoTime: info?.videoTime ?? NaN, videoLocked: !!info?.videoLocked,
+      };
+    });
+    frames.push({ t, targets: per, totalMs: res.timings.total, trackMs: res.timings.track, budget: res.budget, acquired, near });
+  }
+  return { frames, passes, pipeline };
 }
 
 /** Flat target points (m) on a 9 x 7 grid over 90% of the sheet. */

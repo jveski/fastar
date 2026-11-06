@@ -39,5 +39,41 @@ export function acquireCases(): BenchCase[] {
         return () => acq.acquire(empty);
       },
     },
+    ...multiCases(K, img.data, empty, target),
   ];
+}
+
+/**
+ * Several targets: unbounded passes grow with the target count (each
+ * target's matching is ~3 ms here); a budgeted pass stays bounded.
+ */
+function multiCases(K: ReturnType<typeof intrinsicsFromFov>, present: Uint8Array, empty: Uint8Array, first: ReturnType<typeof compileTarget>): BenchCase[] {
+  const others = [23, 37, 41, 53, 67].map((s) => compileTarget(makePoster(640, 480, s), { physicalWidth: 0.2 }));
+  const all = [first, ...others];
+  const out: BenchCase[] = [];
+  for (const n of [3, 6]) {
+    for (const [what, img] of [['one in view', present], ['none in view', empty]] as const) {
+      out.push({
+        name: `acquisition, ${n} targets (${what})`,
+        budgetMs: 25 / 3 + 3.5 * (n - 1),
+        iterations: 30,
+        warmup: 3,
+        setup: () => {
+          const acq = new Acquirer(all.slice(0, n), 640, 480, K);
+          return () => acq.acquireAll(img, { maxResults: n });
+        },
+      });
+    }
+  }
+  out.push({
+    name: 'acquisition pass, 6 targets, 20 ms matching budget on a phone (one in view)',
+    budgetMs: (25 + 20) / 3,
+    iterations: 30,
+    warmup: 3,
+    setup: () => {
+      const acq = new Acquirer(all, 640, 480, K);
+      return () => acq.acquireAll(present, { maxResults: 6, budgetMs: 20 / 3 });
+    },
+  });
+  return out;
 }

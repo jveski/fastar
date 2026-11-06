@@ -1,5 +1,6 @@
 // Generate the committed browser-test fixtures:
 //   targets-image.bin / targets-video.bin   compiled targets
+//   targets-multi.bin                       two poster targets, for the multi scene
 //   <scenario>.mp4                          rendered camera video
 //   <scenario>.session.json                 SessionLog for start({ replay })
 //   <scenario>.truth.json                   per-frame ground truth
@@ -17,7 +18,8 @@ import { makeMotionClip } from '../../../src/sim/motion';
 import { compileTarget } from '../../../src/target/compiler';
 import { compileVideoTarget as compileVideo } from '../../../src/target/video-compiler';
 import { encodeTargets } from '../../../src/target/format';
-import { createSceneRenderer, relativePose, scenarios, sheetShape, simulateImu, type Scenario } from '../../../src/sim/scene';
+import { createMultiSceneRenderer, createSceneRenderer, multiScenarios, relativePose, scenarios, sheetShape, simulateImu, type Scenario } from '../../../src/sim/scene';
+import { screenPriority } from '../../../src/track/budget';
 import { SURFACE_GRID } from '../types';
 import { videoTimeAt } from '../../../src/sim/harness';
 import type { SessionLog } from '../../../src/shell/recorder';
@@ -160,6 +162,34 @@ for (const f of fixtures.filter((x) => !only.length || only.includes(x.name))) {
   }
   makeSession(f, frames, truth);
   console.log(`${f.name}: ${n} frames`);
+}
+
+// Two posters side by side, the camera sweeping from one to the other and
+// back: both are tracked at once, each partly out of view at the ends.
+if (!only.length || only.includes('multi')) {
+  const second = makePoster(640, 480, 23);
+  const multiTargets = [imageTarget, compileTarget(second, { physicalWidth: POSTER_W_M, name: 'browser-image-2' })];
+  writeFileSync(join(OUT, 'targets-multi.bin'), Buffer.from(encodeTargets(multiTargets)));
+  const scn = multiScenarios.gallery(2, 0.24, 0.5, 4);
+  const sims = [poster, second].map((texture) => ({ texture, widthM: POSTER_W_M }));
+  const renderer = createMultiSceneRenderer(scn, K, sims);
+  const n = Math.round(scn.duration * FPS);
+  const frames: GrayImage[] = [];
+  const truth: Array<Record<string, unknown>> = [];
+  const hw = POSTER_W_M / 2, hh = (POSTER_W_M * poster.height) / poster.width / 2;
+  for (let k = 0; k < n; k++) {
+    const t = k / FPS;
+    frames.push(renderer.render(t, scn.camera, { noise: 2, blurPasses: 1, readout: 0.008, exposure: 0.006, exposureSamples: 2 }));
+    const rel = scn.targets.map((tp) => relativePose(scn.camera(t), tp(t)));
+    truth.push({
+      t, mediaTime: k / FPS, R: Array.from(rel[0].R), tv: Array.from(rel[0].t), visible: true, videoTime: null,
+      targets: rel.map((g) => ({ R: Array.from(g.R), tv: Array.from(g.t), inView: screenPriority(K, g.R, g.t, hw, hh).inside })),
+    });
+  }
+  makeSession({
+    name: 'multi', scn: { ...scn, target: scn.targets[0] }, poster, posterWidthM: POSTER_W_M, target: imageTarget, targetFile: 'targets-multi.bin',
+  }, frames, truth);
+  console.log(`multi: ${n} frames`);
 }
 
 console.log(`wrote fixtures to ${OUT}`);
