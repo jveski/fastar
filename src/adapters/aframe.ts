@@ -15,7 +15,8 @@
 //
 // Target entities emit `targetFound`, `targetLost` and `targetNear`, and
 // `contentReady` / `contentUnloaded`. The scene emits `fastar-ready`,
-// `fastar-started` and `fastar-error`.
+// `fastar-started`, `fastar-error`, and `fastar-performance` (detail: the
+// tracker's PerformanceState) when the device's throttling level changes.
 import { ImageTracker, type FrameEvent } from '../shell/image-tracker';
 import { MotionSensors } from '../shell/sensors';
 import { ContentManager } from '../shell/content';
@@ -136,6 +137,7 @@ export function registerAFrame(AFRAME: AFrameLike): void {
         ar.on('found', (i) => this.targets.get(i)?.emit('targetFound'));
         ar.on('lost', (i) => this.targets.get(i)?.emit('targetLost'));
         ar.on('near', (i) => this.targets.get(i)?.emit('targetNear'));
+        ar.on('performance', (p) => this.el.emit('fastar-performance', p));
         ar.onFrame((e) => this.onFrame(e));
         this.startContent(ar);
         await ar.start({ video, useImu: this.data.useImu, requestMotionPermission: true });

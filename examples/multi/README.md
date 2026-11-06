@@ -12,7 +12,7 @@ colour) and the shared overlay code ([`overlay.js`](overlay.js)) at that
 moment. When room is needed, overlays whose clip has been out of view for a
 while are removed and their GPU resources freed. How many stay loaded follows
 the device (`content: { budget: 'auto' }`): more on a laptop or fast phone,
-fewer on a slow one, and fewer still while the frame rate suffers.
+fewer on a slow one, and fewer still while the device cannot keep up.
 
 Tracking time is bounded too. When a camera frame is short of time, the clips
 that matter less (smaller, cut off by the edge of the view, or away from the

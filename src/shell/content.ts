@@ -49,6 +49,8 @@ export interface ContentSource {
   on(event: 'found' | 'lost' | 'near', cb: (index: number) => void): () => void;
   isShown(index: number): boolean;
   readonly stats: { fps: number; targets: ReadonlyArray<{ index: number; priority?: number }> };
+  /** Throttling level (ImageTracker.performance); with it, the 'auto' budget follows the level instead of the frame rate. */
+  readonly performance?: { level: number };
 }
 
 export type ContentEvent = 'ready' | 'unload' | 'error';
@@ -358,8 +360,22 @@ export class ContentManager<T> {
     if (this.used > this.limit) this.evict(0);
   }
 
-  /** 'auto': lower the budget while the frame rate suffers, raise it back once it recovers. */
+  /** 'auto': lower the budget while the device is throttled (or the frame rate suffers), raise it back once it recovers. */
   private sampleFps(): void {
+    const perf = this.src.performance;
+    if (perf) {
+      let visible = 0;
+      for (const e of this.entries.values()) if (e.visible) visible++;
+      const want = Math.min(this.base, Math.max(1, visible, this.base - perf.level));
+      if (want < this.limit) {
+        this.limit = want;
+        this.enforce();
+      } else if (want > this.limit) {
+        this.limit = want;
+        this.pump();
+      }
+      return;
+    }
     const fps = this.src.stats.fps;
     if (!(fps > 0)) return;
     this.bestFps = Math.max(fps, this.bestFps * 0.995);

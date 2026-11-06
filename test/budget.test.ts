@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { CostModel, DEFAULT_BUDGET, allocate, screenPriority, type Demand } from '../src/track/budget';
+import { CostModel, DEFAULT_BUDGET, DEFAULT_STRIDE, StrideControl, allocate, screenPriority, type Demand } from '../src/track/budget';
+import { Pipeline } from '../src/track/pipeline';
+import { intrinsicsFromFov } from '../src/vision/camera';
 import { keepMask, setLoad, DEFAULT_TRACKER, TargetTracker } from '../src/track/tracker';
 import { SurfaceTracker } from '../src/deform/surface-tracker';
 import { targetFor } from '../src/sim/harness';
@@ -186,4 +188,92 @@ describe('tracker load', () => {
       expect(tr.n).toBeGreaterThan(0.8 * full);
     });
   }
+});
+
+describe('tracking stride', () => {
+  const IV = 1000 / 30;
+
+  /** Tracked frames for `secs` from t0 (s): each `gap` camera frames after the last; returns the end time. */
+  function feed(c: StrideControl, t0: number, secs: number, gap: (k: number) => number, fullRateMs: number): number {
+    let t = t0, k = 0;
+    while (t < t0 + secs) {
+      const g = gap(k++);
+      t += (g * IV) / 1000;
+      c.observe(t, g, fullRateMs, IV);
+    }
+    return t;
+  }
+
+  it('tracks every 2nd frame on purpose once frames keep being dropped at uneven gaps', () => {
+    const c = new StrideControl();
+    let t = feed(c, 0, 2, () => 1, 10);
+    expect(c.stride).toBe(1);
+    // Busy past the frame interval: every 2nd or 3rd frame gets through.
+    t = feed(c, t, 1.5, (k) => (k % 2 ? 2 : 3), 40);
+    expect(c.stride).toBe(2);
+    // Now tracking keeps up with every 2nd frame: no drops counted, and no change while full rate does not fit.
+    feed(c, t, 10, () => 2, 40);
+    expect(c.stride).toBe(2);
+    expect(c.overload).toBeLessThan(0.05);
+  });
+
+  it('goes back to every frame once the work fits it with room to spare for a while, waiting longer after a relapse', () => {
+    const c = new StrideControl();
+    let t = feed(c, 0, 1.5, () => 2, 40);
+    expect(c.stride).toBe(2);
+    t = feed(c, t, DEFAULT_STRIDE.hold - 0.2, () => 2, 15);
+    expect(c.stride).toBe(2);
+    t = feed(c, t, 0.5, () => 2, 15);
+    expect(c.stride).toBe(1);
+    // Too soon: drops again within the relapse window.
+    t = feed(c, t, 1.5, () => 2, 40);
+    expect(c.stride).toBe(2);
+    t = feed(c, t, 2 * DEFAULT_STRIDE.hold - 0.3, () => 2, 15);
+    expect(c.stride).toBe(2);
+    feed(c, t, 0.6, () => 2, 15);
+    expect(c.stride).toBe(1);
+  });
+
+  it('a frame dropped now and then is no reason to slow down', () => {
+    const c = new StrideControl();
+    feed(c, 0, 10, (k) => (k % 10 === 9 ? 2 : 1), 20);
+    expect(c.stride).toBe(1);
+  });
+});
+
+describe('tracking budget and the camera frame interval', () => {
+  const W = 64, H = 48;
+  const Ks = intrinsicsFromFov(W, H, 63);
+  const luma = new Uint8Array(W * H).fill(128);
+
+  it('follows the camera interval, not the gaps between the frames it got to (which would grow the budget as the device falls behind)', () => {
+    const p = new Pipeline([], Ks, { width: W, height: H });
+    p.setFrameInterval(1 / 30);
+    let t = 0;
+    for (let k = 0; k < 60; k++) p.processFrame(luma, (t += k % 2 ? 2 / 30 : 3 / 30));
+    expect(p.frameInterval).toBeCloseTo(1 / 30, 6);
+    // The old estimate (the mean gap, 2.5 frames here) gave 0.6 x 83 ms; now the time of the frames it tracks.
+    expect(p.budgetMs).toBeLessThanOrEqual(DEFAULT_BUDGET.share * p.stride * 1000 / 30 + 1e-6);
+    // ... and leaves out the time spent getting each frame's pixels.
+    for (let k = 0; k < 60; k++) p.processFrame(luma, (t += p.stride / 30), 8);
+    expect(p.budgetMs).toBeLessThan(DEFAULT_BUDGET.share * p.stride * 1000 / 30 - 6);
+  });
+
+  it('without the camera interval, estimates it from the shortest gaps', () => {
+    const p = new Pipeline([], Ks, { width: W, height: H });
+    let t = 0;
+    for (let k = 0; k < 20; k++) p.processFrame(luma, (t += 1 / 30));
+    for (let k = 0; k < 40; k++) p.processFrame(luma, (t += k % 3 ? 2 / 30 : 1 / 30));
+    expect(p.frameInterval).toBeLessThan(1.15 / 30);
+  });
+
+  it('gives each tracked frame the time of the frames it skips', () => {
+    const p = new Pipeline([], Ks, { width: W, height: H });
+    p.setFrameInterval(1 / 30);
+    let t = 0;
+    for (let k = 0; k < 60; k++) p.processFrame(luma, (t += k % 2 ? 2 / 30 : 3 / 30));
+    expect(p.stride).toBe(2);
+    p.processFrame(luma, (t += 2 / 30));
+    expect(p.budgetMs).toBeGreaterThan(DEFAULT_BUDGET.share * 1000 / 30 + 5);
+  });
 });

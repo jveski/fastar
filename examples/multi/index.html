@@ -30,7 +30,15 @@
 
       const canvas = document.getElementById('gl');
       const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
-      renderer.setPixelRatio(devicePixelRatio);
+      // Resize only when the view or the pixel ratio changes: setSize reallocates the canvas.
+      let ratio = Math.min(devicePixelRatio, 2), size = '';
+      const fit = () => {
+        const w = canvas.clientWidth, h = canvas.clientHeight, key = `${w}x${h}@${ratio}`;
+        if (key === size) return;
+        size = key;
+        renderer.setPixelRatio(ratio);
+        renderer.setSize(w, h, false);
+      };
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera();
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
@@ -40,6 +48,8 @@
       // view, or off centre) get fewer tracking points, or are updated less often.
       const ar = await ImageTracker.create({ targets: './targets.bin' });
 
+      // A device that cannot keep up asks for a lower pixel ratio (and back up once it can).
+      ar.on('performance', (p) => { ratio = Math.min(p.pixelRatio, 2); });
       const three = new ThreeAdapter(ar, {
         THREE, scene, camera,
         viewSize: () => [canvas.clientWidth, canvas.clientHeight],
@@ -48,7 +58,7 @@
         render: (e) => {
           // videoTime: where each clip is in this camera frame (seconds).
           for (const [i, p] of e.poses) three.contents?.get(i)?.userData.update(p.videoTimeLocked ? p.videoTime : null);
-          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          fit();
           renderer.render(scene, camera);
         },
       });

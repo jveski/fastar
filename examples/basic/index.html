@@ -30,19 +30,29 @@
 
       const canvas = document.getElementById('gl');
       const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
-      renderer.setPixelRatio(devicePixelRatio);
+      // Resize only when the view or the pixel ratio changes: setSize reallocates the canvas.
+      let ratio = Math.min(devicePixelRatio, 2), size = '';
+      const fit = () => {
+        const w = canvas.clientWidth, h = canvas.clientHeight, key = `${w}x${h}@${ratio}`;
+        if (key === size) return;
+        size = key;
+        renderer.setPixelRatio(ratio);
+        renderer.setSize(w, h, false);
+      };
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera();
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
 
       const ar = await ImageTracker.create({ targets: './targets.bin' });
+      // A device that cannot keep up asks for a lower pixel ratio (and back up once it can).
+      ar.on('performance', (p) => { ratio = Math.min(p.pixelRatio, 2); });
       const three = new ThreeAdapter(ar, {
         THREE, scene, camera,
         viewSize: () => [canvas.clientWidth, canvas.clientHeight],
         // Called once per camera frame. With syncDisplay the frame itself is drawn as
         // scene.background, so the cube and the picture always come from the same frame.
         render: () => {
-          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          fit();
           renderer.render(scene, camera);
         },
       });
@@ -60,8 +70,8 @@
         e.target.remove();
         const video = document.getElementById('video');
         try {
-          // syncDisplay: show each camera frame once it has been tracked, with the pose
-          // measured on it, instead of the live <video> with a predicted pose.
+          // syncDisplay: show each camera frame with the pose measured on it (a steady delay after
+          // capture, so it has been tracked), instead of the live <video> with a predicted pose.
           await ar.start({ video, requestMotionPermission: true, syncDisplay: true });
         } catch (err) {
           status.textContent = String(err);

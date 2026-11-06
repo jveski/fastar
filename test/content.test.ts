@@ -271,6 +271,29 @@ describe('content manager', () => {
     m.dispose();
   });
 
+  it('auto budget follows the tracker\'s throttling level where it has one', async () => {
+    const src = new (class extends FakeSource { performance = { level: 0 }; })(), L = loader();
+    const m = new ContentManager(src, { ...L.o, budget: 'auto', keepAlive: 0 }, () => Date.now());
+    const base = m.budget;
+    src.found(0);
+    await flush();
+    await L.finish(0);
+    src.performance.level = 2;
+    // The frame rate is ignored: the level already accounts for it.
+    src.stats.fps = 5;
+    vi.advanceTimersByTime(1000);
+    expect(m.budget).toBe(Math.max(1, base - 2));
+    src.performance.level = 3;
+    vi.advanceTimersByTime(1000);
+    expect(m.budget).toBe(Math.max(1, base - 3));
+    // Never below what is in view.
+    expect(m.state(0)).toBe('ready');
+    src.performance.level = 0;
+    vi.advanceTimersByTime(1000);
+    expect(m.budget).toBe(base);
+    m.dispose();
+  });
+
   it('dispose aborts loads, unloads content and stops listening', async () => {
     const src = new FakeSource(), L = loader();
     const m = new ContentManager(src, { ...L.o, budget: 4 }, () => Date.now());
@@ -291,7 +314,7 @@ describe('ImageTracker target events and helpers', () => {
   const buf = encodeTargets([11, 23, 37].map((s, i) => compileTarget(makePoster(320, 240, s), { physicalWidth: 0.2, name: `p${i}` })));
   const result = (o: Partial<ResultMessage>): ResultMessage => ({
     type: 'result', frameId: 1, t: 0, doneAt: 0, targets: [], found: [], lost: [], timings: { pyramid: 0, track: 0, fusion: 0, total: 0, klt: 0, ncc: 0, solve: 0 },
-    budget: 12, snapshots: [], td: 0, tdCalibrated: false, clocks: [], ...o,
+    budget: 12, load: { stride: 1, overload: 0, interval: 33.3, acquireBusy: 0, prep: 0 }, snapshots: [], td: 0, tdCalibrated: false, clocks: [], ...o,
   });
 
   it('tracks every target by default, finds targets by name, and reports near misses at most once a second', async () => {
@@ -321,5 +344,21 @@ describe('ImageTracker target events and helpers', () => {
     expect(loads).toEqual([1]);
     expect(m.get(1)).toBe(1);
     m.dispose();
+  });
+
+  it('reports its throttling state, with the tracking load from the worker', async () => {
+    const ar = await ImageTracker.create({ targets: buf.slice(0) });
+    expect(ar.performance.level).toBe(0);
+    expect(ar.performance.bottleneck).toBe('none');
+    const off = ar.on('performance', () => {});
+    expect(typeof off).toBe('function');
+    off();
+    const feed = (m: ResultMessage) => (ar as unknown as { onResultMsg(m: ResultMessage): void }).onResultMsg(m);
+    feed(result({ load: { stride: 2, overload: 0.4, interval: 33.3, acquireBusy: 0.25, prep: 1 } }));
+    expect(ar.performance.stride).toBe(2);
+    expect(ar.performance.trackingOverload).toBe(0.4);
+    expect(ar.performance.acquireBusy).toBe(0.25);
+    // The copy path sends the worker one frame in `stride`.
+    expect((ar as unknown as { stride: number }).stride).toBe(2);
   });
 });

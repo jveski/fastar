@@ -20,6 +20,8 @@ export interface FrameSample {
   mediaTime: number;
   presentedFrames: number;
   hasImage: boolean;
+  /** When the frame was emitted (page performance.now() ms). */
+  shownAt?: number;
   poses: PoseSample[];
   /** Video element size in CSS pixels. */
   view: [number, number];
@@ -39,6 +41,7 @@ export interface StatsSample {
   tdCalibrated: boolean;
   budgetMs: number;
   targets: Array<{ index: number; status: string; confidence: number; inliers: number; rms: number; priority?: number; points?: number; every?: number }>;
+  performance?: { level: number; bottleneck: string; stride: number; frameInterval: number; mainBusy: number; jank: number; displayDelay: number; displayLate: number };
 }
 
 export interface Diagnostics {

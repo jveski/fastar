@@ -152,3 +152,38 @@ test.describe('tracker end to end', () => {
     });
   }
 });
+
+test.describe('slow devices', () => {
+  // With syncDisplay, the picture must move at the camera rate however slow tracking is:
+  // here as fast as the camera, and taking 45 ms +/- 30% a frame at 30 fps (a slow phone).
+  for (const slow of [0, 45]) {
+    test(`syncDisplay shows every frame at the camera rate${slow ? ', with a tracker slower than the camera' : ''}`, async ({ page }) => {
+      const t = truth('sweep');
+      const r = await runHarness(page, { mode: 'replay', scenario: 'sweep', sync: '1', slowWorker: slow });
+      expectNoErrors(r);
+      const iv = 1000 / t.fps;
+      // Every camera frame shown, in order, a frame interval apart (once settled).
+      expect(r.frames.length).toBeGreaterThan(100);
+      const shown = r.frames.slice(30);
+      const gaps = shown.slice(1).map((f, k) => f.shownAt! - shown[k].shownAt!);
+      const steps = shown.slice(1).map((f, k) => f.presentedFrames - shown[k].presentedFrames);
+      expect(steps.filter((s) => s !== 1).length / steps.length).toBeLessThan(0.1);
+      expect(Math.abs(percentile(gaps, 0.5) - iv)).toBeLessThan(0.15 * iv);
+      // WebKit's headless display runs late now and then.
+      expect(percentile(gaps, 0.9)).toBeLessThan(2 * iv);
+      // On the target throughout, frames tracked or not.
+      const errors = bestOffset(settled(r), t).errors;
+      expect(percentile(errors, 0.5)).toBeLessThan(3);
+      expect(percentile(errors, 0.95)).toBeLessThan(12);
+      const perf = r.stats!.performance!;
+      expect(perf.displayDelay).toBeLessThanOrEqual(85);
+      if (slow) {
+        // Tracking every 2nd frame on purpose rather than whichever it gets to.
+        expect(perf.stride).toBe(2);
+        expect(perf.bottleneck).toBe('tracking');
+      } else {
+        expect(perf.stride).toBe(1);
+      }
+    });
+  }
+});

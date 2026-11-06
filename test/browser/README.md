@@ -42,6 +42,10 @@ exists on the repository's default branch.
   `start({ replay: { log, video } })`, with per-frame ground truth and overlay
   (or surface) accuracy assertions.
 - **Live stream** input from a canvas `captureStream`, including `syncDisplay`.
+- **Slow devices**: with `syncDisplay`, every camera frame is shown at the
+  camera rate and the overlay stays on target, also with a tracking worker
+  slowed to take longer than a camera frame (`slowWorker=<ms>` wraps the
+  worker script with a busy wait per frame).
 - **`getUserMedia`** via Chromium's fake camera file (`camera-chromium`).
 - **Sensors**: synthetic `devicemotion` fed through `MotionSensors`, plus the
   vision-only permission-denied path.

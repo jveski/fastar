@@ -19,6 +19,10 @@ type Post = (msg: FromTracker, transfer?: Transferable[]) => void;
 
 /** Matching time per acquisition pass (ms): a few targets on a phone, all of a handful on a laptop. */
 export const DEFAULT_ACQUIRE_BUDGET = 20;
+/** Most of the time acquisition may take while something is tracked (the rest is left to tracking and the page). */
+export const DEFAULT_ACQUIRE_DUTY = 0.5;
+/** Window over which the acquisition worker's busy share is measured (ms). */
+const ACQUIRE_WINDOW = 2000;
 /** Seconds a near miss keeps its target first in line for acquisition. */
 const NEAR_KEEP = 2;
 
@@ -39,6 +43,13 @@ export class TrackerCore {
   private arrivalOffset = Infinity;
   private focal: FocalCalibrator | null = null;
   private acquireBudgetMs = DEFAULT_ACQUIRE_BUDGET;
+  private acquireDuty = DEFAULT_ACQUIRE_DUTY;
+  /** When the last acquisition finished (worker ms), and recent ones: [finished at, ms]. */
+  private acqDoneAt = -Infinity;
+  private readonly acqLog: Array<[number, number]> = [];
+  /** Stream path: capture time of the last frame processed (main ms), and the time to get its pixels. */
+  private lastStreamT = -Infinity;
+  private prepMs = 0;
   /** Near misses from acquisition: target -> camera time (s). */
   private readonly near = new Map<number, number>();
 
@@ -49,7 +60,11 @@ export class TrackerCore {
       switch (msg.type) {
         case 'init': return this.init(msg);
         case 'imu': return this.onImu(msg.samples);
-        case 'frame': return this.onFrame(new Uint8Array(msg.luma), msg.t, msg.luma);
+        case 'frame': {
+          // Time the frame waited for this worker (busy with other messages) counts against its budget like reading pixels does.
+          const wait = msg.sentAt !== undefined ? Math.max(0, this.now() + this.clockOffset - msg.sentAt) : 0;
+          return this.onFrame(new Uint8Array(msg.luma), msg.t, msg.luma, wait);
+        }
         case 'stream': void this.readStream(msg.readable); return;
         case 'clock': return this.onClock(msg.mediaTime, msg.captureTime);
         case 'intrinsics':
@@ -58,6 +73,12 @@ export class TrackerCore {
           return;
         case 'priority':
           this.pipeline?.setPriority(msg.index, msg.weight);
+          return;
+        case 'cadence':
+          this.pipeline?.setFrameInterval(msg.interval / 1000);
+          return;
+        case 'throttle':
+          if (msg.acquireDuty > 0) this.acquireDuty = Math.min(1, Math.max(0.02, msg.acquireDuty));
           return;
       }
     } catch (e) {
@@ -99,17 +120,22 @@ export class TrackerCore {
     this.mediaOffset = Number.isNaN(this.mediaOffset) ? off : 0.9 * this.mediaOffset + 0.1 * off;
   }
 
-  /** Process one luma frame captured at main-clock time t (ms). */
-  onFrame(luma: Uint8Array, t: number, transferBack?: ArrayBuffer): void {
+  /** Process one luma frame captured at main-clock time t (ms); prepMs: time spent getting its pixels. */
+  onFrame(luma: Uint8Array, t: number, transferBack?: ArrayBuffer, prepMs = 0): void {
     const p = this.pipeline;
     if (!p) return;
-    const res = p.processFrame(luma, t / 1000);
-    if (res.wantAcquire && !this.acqBusy && this.acq) {
+    this.prepMs = prepMs;
+    const res = p.processFrame(luma, t / 1000, prepMs);
+    const tracking = p.slots.filter((s) => s.status === 'tracking').length;
+    // While something is tracked, acquisition rests in proportion to how
+    // long it takes, so it gets at most acquireDuty of the time: on a phone
+    // with two fast cores it otherwise competes with tracking and the page.
+    const rested = tracking === 0 || this.now() - this.acqDoneAt >= this.lastAcqMs * (1 / this.acquireDuty - 1);
+    if (res.wantAcquire && !this.acqBusy && this.acq && rested) {
       const copy = luma.slice().buffer;
       this.acqBusy = true;
       p.markAcquire(res.frameId);
       const up = p.o.useImu ? p.upVector() : null;
-      const tracking = p.slots.filter((s) => s.status === 'tracking').length;
       this.acq.postMessage({
         type: 'acquire', frameId: res.frameId, luma: copy, exclude: p.trackedIndices(), up: up ? Array.from(up) : null,
         maxResults: Math.max(1, p.o.maxTrack - tracking), priority: this.acquirePriority(res.time), budgetMs: this.acquireBudgetMs,
@@ -142,9 +168,22 @@ export class TrackerCore {
     const p = this.pipeline!;
     return {
       type: 'result', frameId, t, doneAt: this.now() + this.clockOffset, targets, found, lost, timings, budget: p.budgetMs,
+      load: {
+        stride: p.stride, overload: p.strideControl.overload, interval: p.frameInterval * 1000,
+        acquireBusy: this.acquireBusy(), prep: this.prepMs,
+      },
       snapshots: p.slots.map((s) => ({ index: s.index, snap: s.eskf.exportSnapshot(s.eskf.t - 0.4) })),
       td: p.td, tdCalibrated: p.tdCalibrated, clocks: p.clockStates(),
     };
+  }
+
+  /** Share of the last ACQUIRE_WINDOW ms the acquisition worker spent working. */
+  private acquireBusy(): number {
+    const now = this.now(), log = this.acqLog;
+    while (log.length && now - log[0][0] > ACQUIRE_WINDOW) log.shift();
+    let ms = 0;
+    for (const [, d] of log) ms += d;
+    return Math.min(1, ms / ACQUIRE_WINDOW);
   }
 
   /** Targets to try first when acquiring: recent near misses, then recently lost ones. */
@@ -161,6 +200,8 @@ export class TrackerCore {
   private onAcquired(m: AcquireToTracker): void {
     this.acqBusy = false;
     this.lastAcqMs = m.ms;
+    this.acqDoneAt = this.now();
+    this.acqLog.push([this.acqDoneAt, m.ms]);
     const p = this.pipeline;
     if (!p) return;
     const tFrame = p.frameTime(m.frameId);
@@ -212,9 +253,18 @@ export class TrackerCore {
         const tsMs = frame.timestamp / 1000;
         this.arrivalOffset = Math.min(this.arrivalOffset, arrival - tsMs);
         const t = frameCaptureTime(tsMs, arrival, this.mediaOffset, this.arrivalOffset);
+        // Tracking every n-th frame: skip the others before reading their pixels.
+        const p = this.pipeline;
+        if (p && p.stride > 1 && t - this.lastStreamT < (p.stride - 0.5) * p.frameInterval * 1000) {
+          frame.close();
+          continue;
+        }
+        const t0 = this.now();
         const luma = await videoFrameToLuma(frame, this.width, this.height, this.luma!);
         frame.close();
-        if (luma) this.onFrame(luma, t);
+        this.prepMs = this.now() - t0;
+        this.lastStreamT = t;
+        if (luma) this.onFrame(luma, t, undefined, this.prepMs);
       } catch (e) {
         frame.close();
         this.post({ type: 'error', message: (e as Error).message });

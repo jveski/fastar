@@ -11,7 +11,7 @@ import { rateAt } from '../fusion/predict';
 import { mat3, mat3FromQuat, mat3TVec } from '../math/rot';
 import { RollingShutterEstimator } from './rolling-shutter';
 import { SurfaceTracker, type SurfaceOptions } from '../deform/surface-tracker';
-import { CostModel, DEFAULT_BUDGET, allocate, screenPriority, type BudgetOptions, type Demand } from './budget';
+import { CostModel, DEFAULT_BUDGET, StrideControl, allocate, screenPriority, type BudgetOptions, type Demand, type StrideOptions } from './budget';
 
 export interface PipelineOptions {
   width: number;
@@ -36,6 +36,8 @@ export interface PipelineOptions {
   clock?: Partial<ClockOptions>;
   /** How tracking time per frame is bounded and shared among targets. */
   budget?: Partial<BudgetOptions>;
+  /** When to track every 2nd camera frame instead of every one. */
+  stride?: Partial<StrideOptions>;
 }
 
 export const DEFAULT_PIPELINE: Omit<PipelineOptions, 'width' | 'height'> = {
@@ -142,6 +144,11 @@ export interface FrameResult {
   timings: FrameTimings;
   /** Tracking time allowed for this frame (ms). */
   budget: number;
+  /** Camera frames per tracked frame, and the share of recent tracked frames after which frames were dropped. */
+  stride: number;
+  overload: number;
+  /** Camera frame interval (ms). */
+  interval: number;
 }
 
 /** Floors of the tracking budget: points every target keeps, by kind. */
@@ -198,8 +205,15 @@ export class Pipeline {
     surface: new CostModel(0.5, 0.012),
   };
   private frameDt = 1 / 30;
+  /** Camera frame interval (s) from the capture side, or NaN to estimate it from the frames seen. */
+  private cameraDt = NaN;
   private pyramidMs = NaN;
+  /** Time spent getting each frame's pixels before processFrame (ms, e.g. converting to luma). */
+  private overheadMs = 0;
+  private fusionMs = NaN;
   private prevFrameTime = NaN;
+  /** Camera frames per tracked frame. */
+  readonly strideControl: StrideControl;
   private topIndex = -1;
   /** App-set priority weights by target index (default 1). */
   private readonly weights = new Map<number, number>();
@@ -211,6 +225,7 @@ export class Pipeline {
   constructor(readonly targets: TargetData[], public K: Intrinsics, opts: Partial<PipelineOptions> & { width: number; height: number }) {
     this.o = { ...DEFAULT_PIPELINE, ...opts };
     this.bo = { ...DEFAULT_BUDGET, ...this.o.budget };
+    this.strideControl = new StrideControl(this.o.stride);
     this.ring = Array.from({ length: this.o.ringSize }, () => new Pyramid(opts.width, opts.height, 3));
     this.ringId = new Int32Array(this.o.ringSize).fill(-1);
     this.ringTime = new Float64Array(this.o.ringSize);
@@ -219,6 +234,25 @@ export class Pipeline {
   setIntrinsics(K: Intrinsics): void {
     this.K = K;
     for (const s of this.slots) s.tracker.K = K;
+  }
+
+  /**
+   * The camera's frame interval (s), as the capture side sees it. Without
+   * it, the interval is estimated from the gaps between the frames given,
+   * which overstates it when frames are dropped.
+   */
+  setFrameInterval(dt: number): void {
+    if (dt > 0) this.cameraDt = Math.min(0.1, Math.max(1 / 240, dt));
+  }
+
+  /** Camera frame interval (s). */
+  get frameInterval(): number {
+    return this.cameraDt > 0 ? this.cameraDt : this.frameDt;
+  }
+
+  /** Camera frames per tracked frame (the caller skips the others). */
+  get stride(): number {
+    return this.strideControl.stride;
   }
 
   pushImu(t: number, gx: number, gy: number, gz: number, ax = NaN, ay = NaN, az = NaN): void {
@@ -305,12 +339,24 @@ export class Pipeline {
     return w.hi - w.lo > TIME_LOST || this.lastTime - (this.rangeTime.get(index) ?? -Infinity) > RANGE_CHECK;
   }
 
-  processFrame(luma: Uint8Array, tCam: number): FrameResult {
+  /**
+   * Process a frame captured at camera time tCam (s). `prepMs`: time spent
+   * getting its pixels (counted against the frame's time budget).
+   */
+  processFrame(luma: Uint8Array, tCam: number, prepMs = 0): FrameResult {
     const t0 = now();
     this.lastTime = tCam;
     const dt = tCam - this.prevFrameTime;
-    if (dt > 0) this.frameDt += 0.1 * (Math.min(0.1, Math.max(1 / 120, dt)) - this.frameDt);
+    let gap = 0;
+    if (dt > 0) {
+      // Without the camera's own interval: the lower envelope of the gaps
+      // (a dropped frame must not read as a slower camera).
+      const c = Math.min(0.1, Math.max(1 / 240, dt));
+      this.frameDt += (c < this.frameDt ? 0.3 : 0.02) * (c - this.frameDt);
+      gap = Math.max(1, Math.round(dt / this.frameInterval));
+    }
     this.prevFrameTime = tCam;
+    if (prepMs > 0) this.overheadMs += 0.1 * (prepMs - this.overheadMs);
     const id = ++this.frameId;
     const k = id % this.o.ringSize;
     this.ring[k].build(luma);
@@ -429,6 +475,9 @@ export class Pipeline {
     const interval = this.slots.some((s) => s.every > 1) ? 2 * this.o.acquireInterval : this.o.acquireInterval;
     const wantAcquire = (tracking < this.o.maxTrack || timeLost) && (tracking === 0 || id - this.lastAcqFrame >= interval);
     const t2 = now();
+    this.fusionMs = Number.isNaN(this.fusionMs) ? fusionT : this.fusionMs + 0.1 * (fusionT - this.fusionMs);
+    const intervalMs = this.frameInterval * 1000;
+    this.strideControl.observe(tCam, gap, this.fullRateMs(), intervalMs);
     return {
       frameId: id,
       time: tCam,
@@ -438,7 +487,25 @@ export class Pipeline {
       wantAcquire,
       timings: { pyramid: t1 - t0, track: trackT, fusion: fusionT, total: t2 - t0, klt, ncc, solve },
       budget: this.budgetMs,
+      stride: this.stride,
+      overload: this.strideControl.overload,
+      interval: intervalMs,
     };
+  }
+
+  /**
+   * What a frame would cost (ms) tracking every camera frame, with the most
+   * important target at half its points and the others at their floors.
+   */
+  private fullRateMs(): number {
+    let ms = (this.pyramidMs || 0) + this.overheadMs + (this.fusionMs || 0);
+    let top = -1;
+    for (let i = 0; i < this.slots.length; i++) if (top < 0 || this.slots[i].priority > this.slots[top].priority) top = i;
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i], c = this.costModel(s), min = this.minPoints(s);
+      ms += c.cost(i === top ? Math.max(min, 0.5 * s.tracker.o.maxPoints) : min);
+    }
+    return ms;
   }
 
   /** Weight a target's priority in the tracking budget (default 1; 0 tracks it at the floor). */
@@ -480,7 +547,7 @@ export class Pipeline {
         current: s.points, fixed: c.fixed, perPoint: c.perPoint,
       });
     }
-    const budget = (this.budgetMs = bo.budgetMs ?? Math.max(1, bo.share * this.frameDt * 1000 - (this.pyramidMs || 0)));
+    const budget = (this.budgetMs = bo.budgetMs ?? Math.max(1, bo.share * this.frameInterval * this.stride * 1000 - (this.pyramidMs || 0) - this.overheadMs));
     const alloc = allocate(demands, budget, bo);
     for (const a of alloc) {
       const s = this.slot(a.index)!;

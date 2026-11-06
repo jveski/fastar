@@ -131,6 +131,78 @@ export function allocate(demands: Demand[], budgetMs: number, o: BudgetOptions =
   return out;
 }
 
+export interface StrideOptions {
+  /** Most camera frames per tracked frame. */
+  maxStride: number;
+  /** Share of tracked frames after which camera frames were dropped that counts as overload. */
+  overload: number;
+  /** Least time (s) between changes. */
+  minDwell: number;
+  /** Time (s) the device must have room for every frame before going back to it, and its cap. */
+  hold: number;
+  maxHold: number;
+  /** Overloaded again this soon (s) after going back: wait twice as long next time. */
+  relapse: number;
+  /** Share of the frame interval a frame must fit in at full rate to go back to it. */
+  fit: number;
+}
+
+export const DEFAULT_STRIDE: StrideOptions = { maxStride: 2, overload: 0.35, minDwell: 1, hold: 2, maxHold: 30, relapse: 10, fit: 0.75 };
+
+/**
+ * How many camera frames per tracked frame. A device that cannot keep up
+ * with every frame drops whichever frame arrives while it is busy, so the
+ * tracked frames come at uneven gaps (33, 66, 33, 100 ms...), which shows
+ * as stutter. Tracking every 2nd frame on purpose keeps them even (and
+ * leaves twice the time for each). Goes back to every frame only once the
+ * work for it would fit with room to spare for a while, waiting longer
+ * each time that turns out wrong.
+ */
+export class StrideControl {
+  stride = 1;
+  /** Share of recent tracked frames after which camera frames were dropped (0 to 1). */
+  overload = 0;
+  private readonly o: StrideOptions;
+  private changedAt = -Infinity;
+  private backAt = -Infinity;
+  private fitSince = NaN;
+  private hold: number;
+
+  constructor(o: Partial<StrideOptions> = {}) {
+    this.o = { ...DEFAULT_STRIDE, ...o };
+    this.hold = this.o.hold;
+  }
+
+  /**
+   * A tracked frame at time t (s), `gap` camera frames after the previous
+   * one; `fullRateMs` is what a frame would cost at every frame (ms), and
+   * `intervalMs` the camera frame interval.
+   */
+  observe(t: number, gap: number, fullRateMs: number, intervalMs: number): void {
+    const o = this.o;
+    if (gap >= 1) this.overload += 0.15 * ((gap > this.stride ? 1 : 0) - this.overload);
+    if (t - this.changedAt < o.minDwell) return;
+    if (this.stride < o.maxStride && this.overload > o.overload) {
+      if (t - this.backAt < o.relapse) this.hold = Math.min(o.maxHold, 2 * this.hold);
+      this.change(t, this.stride + 1);
+    } else if (this.stride > 1) {
+      if (!(fullRateMs <= o.fit * intervalMs)) this.fitSince = NaN;
+      else if (Number.isNaN(this.fitSince)) this.fitSince = t;
+      else if (t - this.fitSince >= this.hold) {
+        this.change(t, this.stride - 1);
+        this.backAt = t;
+      }
+    }
+  }
+
+  private change(t: number, stride: number): void {
+    this.stride = stride;
+    this.changedAt = t;
+    this.overload = 0;
+    this.fitSince = NaN;
+  }
+}
+
 export interface ScreenInfo {
   /** Share of the image the target covers. */
   coverage: number;

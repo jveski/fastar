@@ -88,6 +88,24 @@ export class LumaGrabber {
     gl.uniform2f(gl.getUniformLocation(prog, 'outSize'), this.width, this.height);
     // Taps at +/- a quarter of the footprint (in texture coords).
     gl.uniform2f(gl.getUniformLocation(prog, 'tap'), 0.25 / this.width, 0.25 / this.height);
+    // Render into a texture of our own and read that back: reading the
+    // canvas's own framebuffer is several times slower in WebKit (Metal
+    // ANGLE copies it row by row), and blocks the page meanwhile.
+    const target = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, this.width / 4, this.height);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+      // The canvas itself is no longer drawn to.
+      gl.canvas.width = gl.canvas.height = 1;
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(fb);
+      gl.deleteTexture(target);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.viewport(0, 0, this.width / 4, this.height);
     this.gl = gl;
     return true;

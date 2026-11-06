@@ -1,7 +1,8 @@
 export const VERSION = '0.1.0';
 
 export { ImageTracker } from './shell/image-tracker';
-export type { CreateOptions, StartOptions, Pose, VideoTime, PresentedFrame, FrameEvent, TrackerStats, DeformableOptions, TrackingBudget } from './shell/image-tracker';
+export type { CreateOptions, StartOptions, SyncDisplayOptions, Pose, VideoTime, PresentedFrame, FrameEvent, TrackerStats, DeformableOptions, TrackingBudget } from './shell/image-tracker';
+export type { PerformanceState, Bottleneck, Effects } from './shell/governor';
 export { ContentManager, deviceContentBudget } from './shell/content';
 export type { ContentOptions, ContentState, ContentLoadContext, ContentEvent, ContentSource } from './shell/content';
 export { Surface } from './shell/surface';

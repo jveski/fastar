@@ -107,14 +107,17 @@ function drawOverlay(ar: ImageTracker, e: FrameEvent) {
 }
 
 function showStats(ar: ImageTracker) {
-  const s = ar.stats, tm = s.timings;
+  const s = ar.stats, tm = s.timings, p = ar.performance;
   const f = (v: number | undefined) => (v === undefined ? '  -  ' : v.toFixed(2).padStart(5));
+  const pct = (v: number) => `${Math.round(100 * v)}%`;
   const tg = s.targets.map((t) => `#${t.index} ${t.status} conf ${t.confidence.toFixed(2)} inl ${t.inliers} rms ${t.rms.toFixed(2)}`).join('\n');
   statsEl.textContent =
     `path ${s.path}  sensors ${s.sensors}  ${ar.processingSize.width}x${ar.processingSize.height}\n` +
     `fps ${s.fps}  latency ${s.latency.toFixed(1)} ms  t_d ${(s.td * 1000).toFixed(1)} ms ${s.tdCalibrated ? '(cal)' : ''}\n` +
     `pyramid ${f(tm?.pyramid)}  klt ${f(tm?.klt)}  ncc ${f(tm?.ncc)}  solve ${f(tm?.solve)}\n` +
-    `fusion  ${f(tm?.fusion)}  track ${f(tm?.track)}  total ${f(tm?.total)}  acquire ${f(tm?.acquire)}\n` +
+    `fusion  ${f(tm?.fusion)}  track ${f(tm?.track)}  total ${f(tm?.total)}  acquire ${f(tm?.acquire)}  budget ${f(s.budgetMs)}\n` +
+    `level ${p.level} (${p.bottleneck})  camera ${p.frameInterval.toFixed(1)} ms  stride ${p.stride}  overload ${pct(p.trackingOverload)}\n` +
+    `page busy ${pct(p.mainBusy)}  late frames ${pct(p.jank)}  acquire busy ${pct(p.acquireBusy)}\n` +
     (tg || 'searching…');
 }
 

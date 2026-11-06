@@ -31,7 +31,15 @@
 
       const canvas = document.getElementById('gl');
       const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
-      renderer.setPixelRatio(devicePixelRatio);
+      // Resize only when the view or the pixel ratio changes: setSize reallocates the canvas.
+      let ratio = Math.min(devicePixelRatio, 2), size = '';
+      const fit = () => {
+        const w = canvas.clientWidth, h = canvas.clientHeight, key = `${w}x${h}@${ratio}`;
+        if (key === size) return;
+        size = key;
+        renderer.setPixelRatio(ratio);
+        renderer.setSize(w, h, false);
+      };
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera();
       scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 2.2));
@@ -44,6 +52,8 @@
       const fluid = createFluid(THREE, ar.targets[0]);
       const down = new THREE.Vector3(0, -1, 0), measured = new THREE.Vector3();
       let last = performance.now();
+      // A device that cannot keep up asks for a lower pixel ratio (and back up once it can).
+      ar.on('performance', (p) => { ratio = Math.min(p.pixelRatio, 2); });
       const three = new ThreeAdapter(ar, {
         THREE, scene, camera,
         viewSize: () => [canvas.clientWidth, canvas.clientHeight],
@@ -58,7 +68,7 @@
             down.lerp(measured, 0.2).normalize();
             fluid.update(p.surface ?? null, down.toArray(), dt);
           }
-          renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+          fit();
           renderer.render(scene, camera);
         },
       });

@@ -10,6 +10,7 @@ import { createSceneRenderer, scenarios, simulateImu, relativePose } from '../sr
 import { PosePredictor } from '../src/fusion/predict';
 import { ImuBuffer } from '../src/fusion/imu';
 import { K, POSTER_W_M, getPoster } from './fixtures';
+import { makePoster } from '../src/sim/poster';
 import { mat3, vec3, rotationAngle } from '../src/math/rot';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -129,5 +130,65 @@ describe('worker cores (tracking + acquisition over a MessageChannel)', () => {
     expect(frameCaptureTime(1000, 5030, 4.4e7, 4020)).toBe(5020);
     // Or after arrival.
     expect(frameCaptureTime(1000, 5030, 4100, 4020)).toBe(5020);
+  });
+
+  /**
+   * Two targets, one in view: once it is tracked, acquisition keeps looking
+   * for the other. Each pass reports taking 200 ms; frames come every 1/30 s
+   * on a fake clock. Returns acquisition passes started while tracking, the
+   * tracker's reports, and the results seen.
+   */
+  function slowAcquisition(duty?: number) {
+    const poster = getPoster();
+    const buf = encodeTargets([targetFor(poster, POSTER_W_M), targetFor(makePoster(640, 480, 29), POSTER_W_M)]);
+    let clock = 0;
+    const msgs: FromTracker[] = [];
+    const core = new TrackerCore((m) => msgs.push(m), () => clock);
+    // Acquisition over a link that answers 200 ms later (on the fake clock), as a slow pass would.
+    const pending: Array<{ at: number; m: unknown }> = [];
+    const toTracker = { onmessage: null as ((e: MessageEvent) => void) | null, postMessage: (m: unknown) => { pending.push({ at: clock + 200, m }); } };
+    const acqPort = { onmessage: null as ((e: MessageEvent) => void) | null, postMessage: (m: { ms: number }) => toTracker.onmessage?.({ data: { ...m, ms: 200 } } as MessageEvent) };
+    const acq = new AcquireCore(() => clock);
+    acq.init({ type: 'init-acquire', targets: buf.slice(0), width: 640, height: 480, K, port: acqPort as unknown as MessagePort });
+    core.handle({
+      type: 'init', targets: buf.slice(0), width: 640, height: 480, K, maxTrack: 2, useImu: false,
+      mainTimeOrigin: performance.timeOrigin, acquirePort: toTracker as unknown as MessagePort,
+    });
+    if (duty !== undefined) core.handle({ type: 'throttle', acquireDuty: duty });
+    const scn = scenarios.static(0.35, 4);
+    const r = createSceneRenderer(scn, { K, poster, posterWidthM: POSTER_W_M });
+    let whileTracking = 0, tracking = false;
+    const results: ResultMessage[] = [];
+    for (let k = 0; k < 90; k++) {
+      clock = (k * 1000) / 30;
+      while (pending.length && pending[0].at <= clock) {
+        const { m } = pending.shift()!;
+        if ((m as { type: string }).type === 'acquire' && tracking) whileTracking++;
+        acqPort.onmessage!({ data: m } as MessageEvent);
+      }
+      core.handle({ type: 'frame', id: k, t: clock, luma: r.render(k / 30, scn.camera, { noise: 2 }).data.slice().buffer });
+      for (const m of msgs.splice(0)) {
+        if (m.type !== 'result') continue;
+        results.push(m as ResultMessage);
+        if ((m as ResultMessage).targets.some((x) => x.status === 'tracking')) tracking = true;
+      }
+    }
+    return { whileTracking, tracking, results };
+  }
+
+  it('while something is tracked, keeps acquisition to its share of the time, as throttled', () => {
+    const half = slowAcquisition();
+    expect(half.tracking).toBe(true);
+    // 200 ms passes at most half the time: one every 400 ms or more, about 7 in the ~2.9 s tracked.
+    expect(half.whileTracking).toBeGreaterThanOrEqual(4);
+    expect(half.whileTracking).toBeLessThanOrEqual(8);
+    const tenth = slowAcquisition(0.1);
+    expect(tenth.tracking).toBe(true);
+    expect(tenth.whileTracking).toBeLessThanOrEqual(2);
+    // The worker reports how busy acquisition kept it, and its tracking load.
+    const last = half.results.filter((m) => !m.acquisition).at(-1)!;
+    expect(last.load.acquireBusy).toBeGreaterThan(0.3);
+    expect(last.load.stride).toBe(1);
+    expect(last.load.interval).toBeCloseTo(1000 / 30, 0);
   });
 });

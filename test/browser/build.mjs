@@ -18,6 +18,16 @@ await esbuild.build({
   legalComments: 'none',
 });
 
+// The worker on its own, for harness runs that wrap it (slowWorker: a slow device's tracker).
+await esbuild.build({
+  entryPoints: ['src/worker/worker-main.ts'],
+  bundle: true,
+  format: 'iife',
+  target: 'es2020',
+  outfile: `${OUT}/worker.js`,
+  legalComments: 'none',
+});
+
 copyFileSync('test/browser/harness.html', `${OUT}/index.html`);
 copyFileSync('dist/fastar.js', `${OUT}/fastar.js`);
 cpSync('test/browser/fixtures/data', `${OUT}/fixtures`, { recursive: true });

@@ -62,7 +62,7 @@ Compile several images or videos into one file and every one of them is tracked,
 npx fastar-compile -o targets.bin poster.png:0.42 cover.jpg:0.21 loop.mp4:1.2
 ```
 
-Each target's content can be loaded only when it is needed: when the target is found, or nearly found as it comes into view (the `near` event). Content out of view for a while is unloaded to make room. How much stays loaded follows the device (`budget: 'auto'`): more on fast phones and computers, less on slow ones, and less still while the frame rate suffers.
+Each target's content can be loaded only when it is needed: when the target is found, or nearly found as it comes into view (the `near` event). Content out of view for a while is unloaded to make room. How much stays loaded follows the device (`budget: 'auto'`): more on fast phones and computers, less on slow ones, and less still while the device cannot keep up.
 
 ```js
 const ar = await ImageTracker.create({ targets: './targets.bin' });
@@ -76,3 +76,20 @@ ar.targets.forEach((t, i) => three.content(i, async ({ signal, name }) => {
 Without three.js, `ar.content({ load, unload, show, hide })` does the same for anything, and in A-Frame `fastar-content="src: model.glb"` (or a video) on a `fastar-target` entity loads it only once that target is found.
 
 The time spent tracking per camera frame is bounded (`budget: { trackMs }`, by default 60% of the frame interval), so a slow phone does not fall behind as targets come into view. Every target in view is still tracked: the most prominent ones (largest, wholly in view, nearest the centre) keep full resolution, and the others are tracked with fewer points, or on fewer frames, when time runs short. `ar.setPriority(index, weight)` favours a target, and `ar.stats.targets` shows each target's priority, points and update rate. `maxTrack` limits how many targets are tracked at once.
+
+## Slow devices
+
+Tracking adjusts itself to the phone it runs on. When it cannot keep up with every camera frame, it tracks every 2nd one, evenly, rather than whichever frames it happens to reach, and looking for targets not yet found takes less of the time.
+
+With `syncDisplay: true` (draw `FrameEvent.image` as the background, as the examples do) every camera frame is shown, at the camera's rate, with the pose measured on it. Frames are shown a steady delay after capture so that most have been tracked by then. The delay follows how long tracking takes on the device, is never more than `syncDisplay: { maxDelay }` (80 ms by default), and is zero while no target is in view.
+
+Rendering is up to the app, so the tracker gives hints. `ar.performance` says how hard the device is pressed (`level`, 0 to 3), what holds it back (`bottleneck`: `'render'`, `'tracking'` or `'none'`), and suggests a `pixelRatio` and a level of `effects` to render with. Apply them when they change:
+
+```js
+ar.on('performance', (p) => {
+  renderer.setPixelRatio(Math.min(p.pixelRatio, 2));
+  shadows.enabled = p.effects === 'full';
+});
+```
+
+In A-Frame the scene emits `fastar-performance` with the same details. `ar.performance` also holds the measurements behind them: the camera's frame interval, the share of the time spent handling frames on the page and looking for targets, late display frames, and the display delay.

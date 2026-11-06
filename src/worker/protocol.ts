@@ -46,12 +46,31 @@ export interface AcquireInit {
 
 export type ToTracker =
   | TrackerInit
-  | { type: 'frame'; id: number; t: number; luma: ArrayBuffer }
+  /** sentAt: when the page posted it (main ms), to tell how long it waited for the worker. */
+  | { type: 'frame'; id: number; t: number; luma: ArrayBuffer; sentAt?: number }
   | { type: 'stream'; readable: ReadableStream }
   | { type: 'imu'; samples: Float64Array }
   | { type: 'clock'; mediaTime: number; captureTime: number }
   | { type: 'intrinsics'; K: Intrinsics }
-  | { type: 'priority'; index: number; weight: number };
+  | { type: 'priority'; index: number; weight: number }
+  /** The camera's frame interval (ms), measured on the main thread. */
+  | { type: 'cadence'; interval: number }
+  /** Most of the time acquisition may take while something is tracked (0 to 1). */
+  | { type: 'throttle'; acquireDuty: number };
+
+/** How loaded the tracking side is. */
+export interface TrackerLoad {
+  /** Camera frames per tracked frame. */
+  stride: number;
+  /** Share of recent tracked frames after which camera frames were dropped. */
+  overload: number;
+  /** Camera frame interval (ms). */
+  interval: number;
+  /** Share of the last few seconds the acquisition worker was busy. */
+  acquireBusy: number;
+  /** Time the frame waited for the worker and getting its pixels in the worker (ms). */
+  prep: number;
+}
 
 export interface ResultMessage {
   type: 'result';
@@ -68,6 +87,7 @@ export interface ResultMessage {
   timings: FrameTimings & { acquire?: number };
   /** Tracking time allowed per frame (ms). */
   budget: number;
+  load: TrackerLoad;
   /** Filter snapshots for the render-side predictor (seconds, main clock). */
   snapshots: Array<{ index: number; snap: Float64Array }>;
   td: number;

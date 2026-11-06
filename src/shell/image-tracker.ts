@@ -17,6 +17,8 @@ import { Recorder, type SessionLog } from './recorder';
 import { Surface, SurfaceFeed } from './surface';
 import { AccelSigns } from '../fusion/gravity';
 import { ContentManager, type ContentOptions } from './content';
+import { DisplayPacer, type PacedFrame } from './pacer';
+import { Governor, deviceStartLevel, type PerformanceState } from './governor';
 
 export interface CreateOptions {
   /** URL of a compiled targets file, or its bytes. */
@@ -86,13 +88,21 @@ export interface StartOptions {
   /** Replay a recorded session (video + log) instead of the live camera and sensors. */
   replay?: { log: SessionLog; video: Blob | string };
   /**
-   * Hold each camera frame until it has been tracked, then emit it with a copy
-   * of the frame (`FrameEvent.image`) to draw as the background. The overlay
-   * then uses the pose measured on that very frame rather than a prediction,
-   * which removes most visible jitter, at the cost of the tracking time in
-   * display latency. Draw `image` instead of showing the <video> element.
+   * Show each camera frame with the pose measured on it rather than a
+   * prediction, which removes most visible jitter: frames are emitted with
+   * a copy of their pixels (`FrameEvent.image`) to draw as the background,
+   * a steady delay after capture so that most have been tracked by then.
+   * The delay follows how long tracking takes on this device, at most
+   * `maxDelay` ms (default 80); a frame not tracked by then is shown on time
+   * with the predicted pose. With no target in view, frames are shown as
+   * they arrive. Draw `image` instead of showing the <video> element.
    */
-  syncDisplay?: boolean;
+  syncDisplay?: boolean | SyncDisplayOptions;
+}
+
+export interface SyncDisplayOptions {
+  /** Most delay (ms) added to the display to wait for tracking results (default 80). */
+  maxDelay?: number;
 }
 
 export interface Pose {
@@ -142,19 +152,12 @@ export interface FrameEvent {
   image?: HTMLCanvasElement | OffscreenCanvas;
 }
 
-/** A presented camera frame waiting for its tracking result (syncDisplay). */
-interface QueuedFrame {
-  captureTime: number;
+/** A camera frame waiting to be shown (syncDisplay). */
+interface DisplayFrame {
   meta: VideoFrameCallbackMetadata;
   image: HTMLCanvasElement | OffscreenCanvas;
-  /** A tracking result for this frame is expected. */
-  expect: boolean;
-  queuedAt: number;
 }
 
-// syncDisplay: frames held at once, and the longest a frame waits for its result (ms).
-const DISPLAY_QUEUE = 4;
-const DISPLAY_MAX_DELAY = 120;
 // Capture-to-display latency (ms) assumed when rVFC gives no captureTime: 1.5 frames at 30 fps plus 10 ms.
 const ASSUMED_LATENCY = 60;
 
@@ -252,12 +255,22 @@ export class ImageTracker {
   /** Regularizes display-quantized frame times (WebKit). */
   private frameClock: RegularClock | null = null;
   // syncDisplay state.
-  private syncDisplay = false;
-  private readonly displayQueue: QueuedFrame[] = [];
+  private pacer: DisplayPacer<DisplayFrame> | null = null;
   private readonly displayImages: Array<HTMLCanvasElement | OffscreenCanvas> = [];
   private displayImageNext = 0;
-  /** Capture time of the newest tracked frame (ms). */
-  private lastResultTime = -Infinity;
+  // Load and throttling.
+  private governor = new Governor();
+  private readonly perfListeners = new Set<(p: PerformanceState) => void>();
+  private rafHandle = 0;
+  /** Camera frame interval (ms) from capture times, and what was last sent to the worker. */
+  private camInterval = NaN;
+  private sentInterval = NaN;
+  private prevCapture = NaN;
+  private prevPresented = -1;
+  /** Copy path: camera frames per tracked frame, and the last frame sent. */
+  private stride = 1;
+  private lastSent = -Infinity;
+  private acquireDuty = NaN;
   /** Targets tracked as bending surfaces, and their shapes. */
   private readonly deformable: number[];
   private readonly surfaces = new Map<number, SurfaceFeed>();
@@ -304,7 +317,14 @@ export class ImageTracker {
     if (!motionAllowed) console.warn(`fastar: motion sensors unavailable (${motionState}); running vision-only`);
     const facing = o.facingMode ?? 'environment';
     const video = (this.video = o.video);
-    this.syncDisplay = !!o.syncDisplay;
+    const sync = o.syncDisplay;
+    this.pacer = sync
+      ? new DisplayPacer<DisplayFrame>(typeof sync === 'object' && sync.maxDelay !== undefined ? { maxDelay: Math.max(0, sync.maxDelay) } : {})
+      : null;
+    this.governor = new Governor({
+      devicePixelRatio: typeof devicePixelRatio === 'number' ? devicePixelRatio : 1,
+      startLevel: deviceStartLevel(),
+    });
     video.muted = true;
     video.playsInline = true;
     video.setAttribute('playsinline', '');
@@ -358,12 +378,18 @@ export class ImageTracker {
       for (let i = 0; i < 2; i++) this.pool.push(new ArrayBuffer(width * height));
     }
     this.running = true;
+    this.post({ type: 'throttle', acquireDuty: (this.acquireDuty = this.governor.acquireDuty) });
+    const settings = this.stream?.getVideoTracks()[0]?.getSettings?.();
+    if (settings?.frameRate && settings.frameRate > 0) this.setCameraInterval(1000 / settings.frameRate);
     this.scheduleFrame();
+    if (typeof requestAnimationFrame === 'function') this.rafHandle = requestAnimationFrame(this.onAnimationFrame);
   }
 
   stop(): void {
     this.running = false;
     if (this.video && this.rvfcHandle && 'cancelVideoFrameCallback' in this.video) this.video.cancelVideoFrameCallback(this.rvfcHandle);
+    if (this.rafHandle && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.rafHandle);
+    this.rafHandle = 0;
     this.sensors?.stop();
     clearInterval(this.replayTimer);
     this.tracker?.terminate();
@@ -378,9 +404,12 @@ export class ImageTracker {
     this.clocks.clear();
     this.surfaces.clear();
     this.accelSigns.reset();
-    this.displayQueue.length = 0;
-    this.lastResultTime = -Infinity;
+    this.pacer?.clear();
     this.frameClock = null;
+    this.camInterval = this.sentInterval = this.prevCapture = NaN;
+    this.prevPresented = -1;
+    this.stride = 1;
+    this.lastSent = -Infinity;
   }
 
   /** CSS object-fit of the video, which the projection (and a drawn background) follows. */
@@ -392,10 +421,30 @@ export class ImageTracker {
    * 'found' / 'lost': a target came into view or left it. 'near': a target
    * not yet tracked nearly matched (far away, blurred, coming into view);
    * it is likely found soon, so its content can start loading.
+   * 'performance': the throttling level changed (see `performance`).
    */
-  on(event: TargetEvent, cb: Listener): () => void {
-    this.listeners[event].add(cb);
-    return () => this.listeners[event].delete(cb);
+  on(event: TargetEvent, cb: Listener): () => void;
+  on(event: 'performance', cb: (p: PerformanceState) => void): () => void;
+  on(event: TargetEvent | 'performance', cb: Listener | ((p: PerformanceState) => void)): () => void {
+    if (event === 'performance') {
+      const f = cb as (p: PerformanceState) => void;
+      this.perfListeners.add(f);
+      return () => this.perfListeners.delete(f);
+    }
+    const f = cb as Listener;
+    this.listeners[event].add(f);
+    return () => this.listeners[event].delete(f);
+  }
+
+  /**
+   * How loaded this device is, and hints for the app's rendering: when it
+   * cannot keep up, `level` rises and `pixelRatio` / `effects` suggest
+   * cheaper rendering (apply them on the 'performance' event). Tracking
+   * throttles itself; `bottleneck` says whether rendering or tracking is
+   * what holds the frame rate back.
+   */
+  get performance(): PerformanceState {
+    return this.governor.state;
   }
 
   /** Target `index` is in view (between its 'found' and 'lost'). */
@@ -568,7 +617,11 @@ export class ImageTracker {
       this.stats.timings = m.timings;
       this.stats.targets = m.targets;
       this.stats.budgetMs = m.budget;
-      if (m.t > this.lastResultTime) this.lastResultTime = m.t;
+      this.pacer?.result(m.t, now);
+      if (m.load) {
+        this.stride = m.load.stride;
+        this.governor.setTrackingLoad(m.load);
+      }
     }
     this.stats.td = m.td;
     this.stats.tdCalibrated = m.tdCalibrated;
@@ -610,8 +663,8 @@ export class ImageTracker {
       this.nearAt.set(i, now);
       this.listeners.near.forEach((cb) => cb(i));
     }
+    if (this.pacer) this.pacer.active = this.shown.size > 0;
     this.onResult?.(m);
-    if (this.syncDisplay) this.flushDisplay();
   }
 
   private scheduleFrame(): void {
@@ -630,35 +683,85 @@ export class ImageTracker {
 
   private onVideoFrame(_now: number, meta: VideoFrameCallbackMetadata): void {
     if (!this.running) return;
+    const t0 = performance.now();
     let captureTime = this.captureTimeOf(meta);
     if (this.replayLog) {
       // Recorded media time 0 is the first recorded frame; map onto the playback clock.
       if (Number.isNaN(this.replayShift)) this.replayShift = performance.now() - (this.replayLog.startTime + meta.mediaTime * 1000);
       captureTime = this.replayLog.startTime + meta.mediaTime * 1000 + this.replayShift;
     }
+    this.measureCadence(captureTime, meta.presentedFrames);
     if (meta.captureTime !== undefined && this.stats.path === 'track-processor' && meta.presentedFrames % 10 === 0) {
       this.post({ type: 'clock', mediaTime: meta.mediaTime, captureTime: meta.captureTime });
     }
-    let sent = false;
-    if (this.stats.path === 'copy' && !this.busy && this.grabber && this.pool.length) {
+    // Copy path: one frame in `stride` (the worker says how many it keeps up with), and only when it is free.
+    if (this.stats.path === 'copy' && !this.busy && this.grabber && this.pool.length && meta.presentedFrames - this.lastSent >= this.stride) {
       const buf = this.pool.pop()!;
       if (this.grabber.grab(this.video!, new Uint8Array(buf))) {
-        this.busy = sent = true;
+        this.busy = true;
+        this.lastSent = meta.presentedFrames;
         // The filter applies a frame only once gyro data covers its capture time.
         this.flushImu();
-        this.post({ type: 'frame', id: meta.presentedFrames, t: captureTime, luma: buf }, [buf]);
+        this.post({ type: 'frame', id: meta.presentedFrames, t: captureTime, luma: buf, sentAt: performance.now() }, [buf]);
       } else {
         this.pool.push(buf);
       }
     }
     this.recorder.onVideoFrame(captureTime, meta, this.video!);
-    if (this.syncDisplay) {
-      this.queueDisplay(captureTime, meta, this.stats.path === 'track-processor' || sent);
+    if (this.pacer) {
+      this.queueDisplay(captureTime, meta, t0);
+      this.pace();
     } else {
       // Pose for exactly this presented frame (no prediction to "now").
       this.emitFrame(captureTime, meta);
     }
+    this.governor.addMain(performance.now() - t0);
     this.scheduleFrame();
+  }
+
+  /** Every display frame: show the paced frame that is due, and keep the load measurements going. */
+  private readonly onAnimationFrame = (now: number): void => {
+    if (!this.running) return;
+    this.rafHandle = requestAnimationFrame(this.onAnimationFrame);
+    const t0 = performance.now();
+    this.governor.animationFrame(now);
+    if (this.pacer) {
+      this.pace();
+      this.governor.display.delay = this.pacer.extraDelay;
+      this.governor.display.late = this.pacer.shown ? this.pacer.late / this.pacer.shown : 0;
+    }
+    const t1 = performance.now();
+    this.governor.addMain(t1 - t0);
+    if (this.governor.update(t1)) this.onPerformanceChange();
+  };
+
+  private onPerformanceChange(): void {
+    const duty = this.governor.acquireDuty;
+    if (duty !== this.acquireDuty) this.post({ type: 'throttle', acquireDuty: (this.acquireDuty = duty) });
+    if (this.perfListeners.size) {
+      const s = this.governor.state;
+      this.perfListeners.forEach((cb) => cb(s));
+    }
+  }
+
+  /** The camera's frame interval from the presented frames' capture times; the worker budgets by it. */
+  private measureCadence(captureTime: number, presented: number): void {
+    const n = presented - this.prevPresented, d = captureTime - this.prevCapture;
+    this.prevPresented = presented;
+    this.prevCapture = captureTime;
+    if (!(n >= 1 && n <= 8) || !(d > 0)) return;
+    const iv = d / n;
+    if (!(iv > 4 && iv < 200)) return;
+    this.setCameraInterval(Number.isNaN(this.camInterval) ? iv : this.camInterval + 0.05 * (iv - this.camInterval));
+  }
+
+  private setCameraInterval(iv: number): void {
+    this.camInterval = iv;
+    if (this.pacer) this.pacer.capacity = Math.min(12, Math.ceil(this.pacer.maxDelay / iv) + 3);
+    if (Number.isNaN(this.sentInterval) || Math.abs(iv - this.sentInterval) > 0.02 * this.sentInterval) {
+      this.sentInterval = iv;
+      this.post({ type: 'cadence', interval: iv });
+    }
   }
 
   /**
@@ -741,25 +844,21 @@ export class ImageTracker {
     return true;
   }
 
-  /** syncDisplay: copy the presented frame and hold it until it is tracked. */
-  private queueDisplay(captureTime: number, meta: VideoFrameCallbackMetadata, expect: boolean): void {
+  /** syncDisplay: copy the presented frame and hand it to the pacer. */
+  private queueDisplay(captureTime: number, meta: VideoFrameCallbackMetadata, arrival: number): void {
     const v = this.video!;
-    // Full queue: show the oldest now rather than drop frames silently.
-    while (this.displayQueue.length >= DISPLAY_QUEUE - 1) {
-      const e = this.displayQueue.shift()!;
-      this.emitFrame(e.captureTime, e.meta, e.image);
-    }
     const image = this.nextDisplayImage(v.videoWidth, v.videoHeight);
     const ctx = image.getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
     if (!ctx) return this.emitFrame(captureTime, meta);
     ctx.drawImage(v, 0, 0, image.width, image.height);
-    this.displayQueue.push({ captureTime, meta, image, expect, queuedAt: performance.now() });
-    this.flushDisplay();
+    this.pacer!.push({ captureTime, arrival, payload: { meta, image } });
   }
 
+  /** Copies are reused round-robin: one more than the pacer holds, plus the one on screen. */
   private nextDisplayImage(w: number, h: number): HTMLCanvasElement | OffscreenCanvas {
-    const k = this.displayImageNext;
-    this.displayImageNext = (k + 1) % DISPLAY_QUEUE;
+    const n = this.pacer!.capacity + 2;
+    const k = this.displayImageNext % n;
+    this.displayImageNext = (k + 1) % n;
     let c = this.displayImages[k];
     if (!c) {
       c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
@@ -769,24 +868,10 @@ export class ImageTracker {
     return c;
   }
 
-  /**
-   * Show the newest queued frame that is ready: tracked (a result at or after
-   * its capture time), not sent for tracking with nothing earlier pending, or
-   * waiting too long. Older frames are skipped; only one can be on screen.
-   */
-  private flushDisplay(): void {
-    const q = this.displayQueue;
-    const now = performance.now();
-    let pick = -1;
-    for (let i = 0; i < q.length; i++) {
-      const e = q[i];
-      if (e.captureTime <= this.lastResultTime + 4 || now - e.queuedAt > DISPLAY_MAX_DELAY || !e.expect) pick = i;
-      else break;
-    }
-    if (pick < 0) return;
-    const e = q[pick];
-    q.splice(0, pick + 1);
-    this.emitFrame(e.captureTime, e.meta, e.image);
+  /** Show the frame that is due now, if any. */
+  private pace(): void {
+    const f: PacedFrame<DisplayFrame> | null = this.pacer!.next(performance.now());
+    if (f) this.emitFrame(f.captureTime, f.payload.meta, f.payload.image);
   }
 
   /** Feed recorded IMU samples on the playback clock. */
