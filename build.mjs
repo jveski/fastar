@@ -89,6 +89,8 @@ copyFileSync('examples/video/clip.mp4', 'dist/site/demo/video/clip.mp4');
 copyFileSync('examples/video/targets.bin', 'dist/site/demo/video/targets.bin');
 copyFileSync('examples/video/scene.json', 'dist/site/demo/video/scene.json');
 copyFileSync('examples/video/overlay.js', 'dist/site/demo/video/overlay.js');
+mkdirSync('dist/site/demo/paper', { recursive: true });
+for (const f of ['target.png', 'targets.bin', 'fluid.js']) copyFileSync(`examples/paper/${f}`, `dist/site/demo/paper/${f}`);
 
 execFileSync('npx', ['tsc', '-p', 'tsconfig.build.json'], { stdio: 'inherit' });
 

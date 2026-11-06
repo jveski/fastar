@@ -5,6 +5,7 @@ import type { ClockState, FrameTargetInfo, FrameTimings } from '../track/pipelin
 import type { EskfOptions } from '../fusion/eskf';
 import type { TrackerOptions } from '../track/tracker';
 import type { AcquireTime } from '../track/acquire';
+import type { SurfaceOptions } from '../deform/surface-tracker';
 
 export interface TrackerInit {
   type: 'init';
@@ -24,6 +25,9 @@ export interface TrackerInit {
   tracker?: Partial<TrackerOptions>;
   /** Collect homographies for focal-length self-calibration. */
   calibrateFocal?: boolean;
+  /** Targets tracked as bending surfaces, and their mesh options. */
+  deformable?: number[];
+  surface?: Partial<SurfaceOptions>;
 }
 
 export interface AcquireInit {
@@ -60,6 +64,12 @@ export interface ResultMessage {
   tdCalibrated: boolean;
   /** Video targets' clocks (render side computes the video time of any frame). */
   clocks: ClockState[];
+  /**
+   * Bending targets tracked in this frame: mesh vertices (cols x rows,
+   * row-major from the top-left) in target metres, OpenCV axes (x right,
+   * y down, z into the target), relative to the target's pose.
+   */
+  surfaces?: Array<{ index: number; cols: number; rows: number; vertices: Float32Array }>;
   /** Luma buffer handed back for reuse (copy path). */
   buffer?: ArrayBuffer;
   /** Extra report sent right after an acquisition, not the result of a submitted frame. */

@@ -10,7 +10,7 @@ const name = (process.argv[2] ?? 'static') as keyof typeof scenarios;
 const useImu = process.argv.includes('imu');
 const scn = (scenarios[name] as () => any)();
 const r = runScenario(scn, { K, poster, posterWidthM: 0.2, useImu, td: useImu ? Number((process.argv.find((a) => a.startsWith('td=')) ?? 'td=0.03').slice(3)) : 0, imu: { gyroBias: process.argv.includes('nobias') ? [0, 0, 0] : [0.01, -0.02, 0.015] },
-  pipeline: { eskf: { ...(process.argv.includes('nograv') ? { gravityNoise: 1e6 } : {}), ...(process.argv.includes('notd') ? { estimateTd: false } : {}) } } });
+  pipeline: { ...(process.argv.includes('deform') ? { deformable: [0] } : {}), eskf: { ...(process.argv.includes('nograv') ? { gravityNoise: 1e6 } : {}), ...(process.argv.includes('notd') ? { estimateTd: false } : {}) } } });
 const vis = r.frames.filter((f) => f.visible);
 console.log(`${scn.name} imu=${useImu}: frames=${r.frames.length} visible=${vis.length} acq=${r.acquisitions}/${r.acquireAttempts} firstLock=${r.firstLockTime.toFixed(3)}s`);
 const ov = vis.map((f) => f.overlayErrPx);
@@ -18,5 +18,7 @@ console.log(`overlay px: median=${percentile(ov, 0.5).toFixed(3)} p95=${percenti
 console.log(`trans err mm: median=${(percentile(vis.map((f) => f.transErr), 0.5) * 1000).toFixed(2)}  rot err deg median=${percentile(vis.map((f) => f.rotErrDeg), 0.5).toFixed(3)}`);
 const j = jitter(r.frames.filter((f) => f.t > 0.5));
 console.log(`jitter: trans=${(j.transStd * 1000).toFixed(3)} mm rot=${j.rotStdDeg.toFixed(4)} deg`);
+const sp = vis.map((f) => f.surfaceErrPx), s3 = vis.map((f) => f.surfaceErr3d * 1000), sm = vis.map((f) => f.surfaceMaxPx);
+console.log(`surface px: median=${percentile(sp, 0.5).toFixed(2)} p95=${percentile(sp, 0.95).toFixed(2)} worst-point median=${percentile(sm, 0.5).toFixed(2)}  3d mm: median=${percentile(s3, 0.5).toFixed(2)} p95=${percentile(s3, 0.95).toFixed(2)}`);
 console.log(`track ms: median=${percentile(r.frames.map((f) => f.trackMs), 0.5).toFixed(2)} p95=${percentile(r.frames.map((f) => f.trackMs), 0.95).toFixed(2)}`);
-if (process.argv.includes('v')) for (const f of r.frames) console.log(f.t.toFixed(3), f.status, f.visible ? 'V' : '-', f.inliers, f.overlayErrPx.toFixed(2), (f.transErr*1000).toFixed(2), f.rotErrDeg.toFixed(3), f.acquired ? 'ACQ' : '');
+if (process.argv.includes('v')) for (const f of r.frames) console.log(f.t.toFixed(3), f.status, f.visible ? 'V' : '-', f.inliers, f.overlayErrPx.toFixed(2), (f.transErr*1000).toFixed(2), f.rotErrDeg.toFixed(3), f.surfaceErrPx.toFixed(2), f.acquired ? 'ACQ' : '');

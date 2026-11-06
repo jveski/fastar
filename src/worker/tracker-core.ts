@@ -2,6 +2,7 @@
 // driven directly in tests.
 import { decodeTargets, type TargetData } from '../target/format';
 import { Pipeline } from '../track/pipeline';
+import { TargetTracker } from '../track/tracker';
 import type { AcquireResult } from '../track/acquire';
 import { videoFrameToLuma } from './luma';
 import type {
@@ -60,6 +61,7 @@ export class TrackerCore {
     this.clockOffset = (typeof performance !== 'undefined' ? performance.timeOrigin : 0) - m.mainTimeOrigin;
     const p = new Pipeline(this.targets, m.K, {
       width: m.width, height: m.height, maxTrack: m.maxTrack, useImu: m.useImu, eskf: m.eskf, tracker: m.tracker,
+      deformable: m.deformable, surface: m.surface,
     });
     if (m.axisSigns) p.axisSigns.set(m.axisSigns);
     if (m.td !== undefined) p.setTd(m.td, !!m.tdCalibrated);
@@ -101,8 +103,16 @@ export class TrackerCore {
     }
     if (this.focal) this.collectFocal();
     const msg = this.buildResult(res.frameId, t, res.targets, res.found, res.lost, { ...res.timings, acquire: this.lastAcqMs });
+    const surfaces = p.surfaces();
+    if (surfaces.length) {
+      msg.surfaces = surfaces.map((s) => ({ index: s.index, cols: s.cols, rows: s.rows, vertices: Float32Array.from(s.vertices) }));
+    }
     if (transferBack) msg.buffer = transferBack;
-    this.post(msg, [...msg.snapshots.map((s) => s.snap.buffer as ArrayBuffer), ...(transferBack ? [transferBack] : [])]);
+    this.post(msg, [
+      ...msg.snapshots.map((s) => s.snap.buffer as ArrayBuffer),
+      ...(msg.surfaces ?? []).map((s) => s.vertices.buffer as ArrayBuffer),
+      ...(transferBack ? [transferBack] : []),
+    ]);
     if (p.tdCalibrated && !this.reportedCalibration && p.tdResult) {
       this.reportedCalibration = true;
       this.post({
@@ -131,7 +141,7 @@ export class TrackerCore {
     const res: AcquireResult = { ...r, timings: { features: 0, match: 0, total: m.ms } };
     const found = p.applyAcquisition(res, m.frameId);
     if (found !== null) {
-      this.focal?.addHomography(r.H, this.targets[r.target]);
+      if (!p.o.deformable?.includes(r.target)) this.focal?.addHomography(r.H, this.targets[r.target]);
       // Report immediately so rendering can start before the next frame.
       const lid = p.latestFrameId;
       const slot = p.slot(found)!;
@@ -146,7 +156,8 @@ export class TrackerCore {
   private collectFocal(): void {
     const p = this.pipeline!;
     for (const s of p.slots) {
-      if (s.status === 'tracking') this.focal!.addTracked(s.tracker, this.targets[s.index]);
+      // Bending targets are not planar: their homographies say nothing reliable about the focal length.
+      if (s.status === 'tracking' && s.tracker instanceof TargetTracker) this.focal!.addTracked(s.tracker, this.targets[s.index]);
     }
     const f = this.focal!.estimate();
     if (f) {

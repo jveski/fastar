@@ -140,3 +140,45 @@ export function eigenSym(A: Float64Array, n: number, values: Float64Array, V: Fl
     }
   }
 }
+
+/**
+ * In-place banded Cholesky of an SPD matrix with half-bandwidth b, stored as
+ * the lower band row by row: A[i][j] (i - b <= j <= i) at i * (b + 1) + j - i + b.
+ * Returns false if A is not positive definite.
+ */
+export function bandCholesky(A: Float64Array, n: number, b: number): boolean {
+  const w = b + 1;
+  for (let i = 0; i < n; i++) {
+    const j0 = i > b ? i - b : 0, ri = i * w - i + b;
+    for (let j = j0; j <= i; j++) {
+      const rj = j * w - j + b;
+      let s = A[ri + j];
+      // Row j's band starts at or before j0 (j - b <= i - b), so the overlap runs from j0.
+      for (let k = j0; k < j; k++) s -= A[ri + k] * A[rj + k];
+      if (j === i) {
+        if (!(s > 0)) return false;
+        A[ri + i] = Math.sqrt(s);
+      } else {
+        A[ri + j] = s / A[rj + j];
+      }
+    }
+  }
+  return true;
+}
+
+/** Solve L L^T x = rhs in place (rhs becomes x) given bandCholesky's factor. */
+export function bandSolve(L: Float64Array, n: number, b: number, x: Float64Array): void {
+  const w = b + 1;
+  for (let i = 0; i < n; i++) {
+    const ri = i * w - i + b;
+    let s = x[i];
+    for (let k = i > b ? i - b : 0; k < i; k++) s -= L[ri + k] * x[k];
+    x[i] = s / L[ri + i];
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    let s = x[i];
+    const k1 = i + b < n - 1 ? i + b : n - 1;
+    for (let k = i + 1; k <= k1; k++) s -= L[k * w - k + b + i] * x[k];
+    x[i] = s / L[i * w + b];
+  }
+}

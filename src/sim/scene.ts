@@ -6,6 +6,7 @@ import type { GrayImage } from '../image/gray';
 import type { Intrinsics } from '../vision/camera';
 import { Renderer, type RigidPose, type TexturedPlane } from './renderer';
 import { makeBackground } from './poster';
+import { animatedBend, bends, type BendSpec, type SheetShape } from './bend';
 
 export const GRAVITY = 9.81;
 
@@ -34,6 +35,8 @@ export interface Scenario {
   camera: (t: number) => RigidPose;
   target: (t: number) => RigidPose;
   occluded?: (t: number) => boolean;
+  /** The target is a sheet of paper bent like this (null or absent while flat). */
+  bend?: (t: number) => BendSpec | null;
 }
 
 const staticTarget = (): RigidPose => pose(WALL_R, [0, 0, 0]);
@@ -107,6 +110,41 @@ export const scenarios = {
     target: staticTarget,
     occluded: (t) => t >= start && t < start + length,
   }),
+  /** A sheet curled across `angle` with curvature k (1/m; negative toward the camera), the camera wandering. */
+  curl: (k = -5, angle = 0, dist = 0.35, duration = 3): Scenario => ({
+    name: `curl-${k}`,
+    duration,
+    camera: (t) => viewFrom(dist, 0.04 * Math.sin(1.1 * t), 0.03 * Math.sin(0.7 * t), [0.05 * Math.sin(1.3 * t), 0.08 * Math.sin(0.9 * t), 0]),
+    target: staticTarget,
+    bend: () => bends.curl(angle, k),
+  }),
+  /** Starts flat, then flexes between flat and a curl of curvature kMax at `hz`. */
+  flex: (kMax = -6, hz = 0.5, angle = 0.3, dist = 0.35, duration = 4): Scenario => ({
+    name: `flex-${kMax}`,
+    duration,
+    camera: (t) => viewFrom(dist, 0.03 * Math.sin(0.8 * t), 0.02 * Math.sin(1.2 * t), [0.04 * Math.sin(1.1 * t), 0.06 * Math.sin(0.7 * t), 0]),
+    target: staticTarget,
+    bend: (t) => {
+      const a = t < 0.5 ? 0 : 0.5 - 0.5 * Math.cos(2 * Math.PI * hz * (t - 0.5));
+      return a < 1e-3 ? null : bends.curl(angle, kMax * a);
+    },
+  }),
+  /** A corner lifted toward the camera along a diagonal fold. */
+  cornerLift: (k = -12, dist = 0.35, duration = 3): Scenario => ({
+    name: 'corner-lift',
+    duration,
+    camera: (t) => viewFrom(dist, 0.03 * Math.sin(t), 0.02 * Math.sin(1.3 * t), [0.04 * Math.sin(0.9 * t), 0.05 * Math.sin(1.2 * t), 0]),
+    target: staticTarget,
+    bend: () => bends.lift(Math.PI / 4, 0.04, k, 0.02),
+  }),
+  /** A gentle wave across the sheet. */
+  wave: (k = 10, wavelength = 0.16, dist = 0.35, duration = 3): Scenario => ({
+    name: 'wave',
+    duration,
+    camera: (t) => viewFrom(dist, 0.04 * Math.sin(0.9 * t), 0.02 * Math.sin(1.4 * t), [0.04 * Math.sin(1.2 * t), 0.06 * Math.sin(0.8 * t), 0]),
+    target: staticTarget,
+    bend: () => bends.wave(Math.PI / 2, k, wavelength),
+  }),
   movingTarget: (dist = 0.4, duration = 4): Scenario => ({
     name: 'moving-target',
     duration,
@@ -134,6 +172,15 @@ export interface SimSceneOptions {
   seed?: number;
   /** The poster is a screen playing this (frames the size of `poster`). */
   textureAt?: (t: number) => GrayImage;
+  /** Shape of a bent target (defaults to the scenario's bend). */
+  shape?: (t: number) => SheetShape | null;
+}
+
+/** The scenario's bent sheet for a poster of the given size (null if it stays flat). */
+export function sheetShape(scn: Scenario, poster: GrayImage, posterWidthM: number): ((t: number) => SheetShape | null) | null {
+  if (!scn.bend) return null;
+  const hw = posterWidthM / 2, hh = (posterWidthM * poster.height) / poster.width / 2;
+  return animatedBend(scn.bend, hw, hh);
 }
 
 /** Wall + poster + optional occluder, wired to a scenario. */
@@ -144,9 +191,11 @@ export function createSceneRenderer(scn: Scenario, o: SimSceneOptions): Renderer
     const R = p.R;
     return pose(R, [p.p[0] + R[2] * dz, p.p[1] + R[5] * dz, p.p[2] + R[8] * dz]);
   };
+  const shape = o.shape ?? sheetShape(scn, o.poster, o.posterWidthM) ?? undefined;
+  // A sheet bending away from the camera needs room behind it.
   const planes: TexturedPlane[] = [
-    { pose: () => behind(staticTarget(), 0.002), texture: wall, metersPerTexel: 0.002, tile: true },
-    { pose: scn.target, texture: o.poster, textureAt: o.textureAt, metersPerTexel: mpt },
+    { pose: () => behind(staticTarget(), shape ? 0.1 : 0.002), texture: wall, metersPerTexel: 0.002, tile: true },
+    { pose: scn.target, texture: o.poster, textureAt: o.textureAt, metersPerTexel: mpt, shape },
   ];
   if (scn.occluded) {
     const occ = makeBackground(256, 777);

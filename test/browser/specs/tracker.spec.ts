@@ -1,6 +1,6 @@
 import { expect, test, type TestInfo } from '@playwright/test';
 import {
-  bestOffset, expectNoErrors, firstLockMs, percentile, runHarness, settled, staticJitterMm, truth,
+  bestOffset, bestSurfaceErrors, expectNoErrors, firstLockMs, percentile, runHarness, settled, staticJitterMm, truth,
   videoLockedRatio, videoTimeErrors, visibleRatio,
 } from '../metrics';
 
@@ -39,6 +39,18 @@ test.describe('tracker end to end', () => {
     const errors = bestOffset(settled(r), t).errors;
     expect(percentile(errors, 0.5)).toBeLessThan(3);
     expect(percentile(errors, 0.95)).toBeLessThan(12);
+  });
+
+  test('replays a page that curls: the bending target surface follows it', async ({ page }) => {
+    const t = truth('curl');
+    const r = await runHarness(page, { mode: 'replay', scenario: 'curl', deformable: 1 });
+    expectNoErrors(r);
+    expect(visibleRatio(r)).toBeGreaterThan(0.9);
+    const errors = bestSurfaceErrors(settled(r), t);
+    expect(errors.length).toBeGreaterThan(60);
+    // A rigid plane misses the curl by several pixels at the grid's edges.
+    expect(percentile(errors, 0.5)).toBeLessThan(1.5);
+    expect(percentile(errors, 0.95)).toBeLessThan(4);
   });
 
   test('replays an occlusion: reports lost and reacquires', async ({ page }) => {

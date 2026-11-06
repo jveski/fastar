@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { projectPoint } from '../../src/vision/pose';
-import type { FrameSample, HarnessResult, Truth } from './types';
+import { SURFACE_GRID, type FrameSample, type HarnessResult, type Truth } from './types';
 
 export const FIXTURES = join(process.cwd(), 'test/browser/fixtures/data');
 
@@ -54,6 +54,42 @@ export function overlayErrors(r: HarnessResult, t: Truth, offsetFrames = 0): num
     }
   }
   return out;
+}
+
+/**
+ * Bending targets: per-frame mean image distance (processing pixels) between
+ * the reported surface at SURFACE_GRID (through the pose) and the true sheet.
+ */
+export function surfaceErrors(r: HarnessResult, t: Truth, offsetFrames = 0): number[] {
+  const K = t.intrinsics, out: number[] = [];
+  for (const f of r.frames) {
+    const gt = frameTruth(f, t, offsetFrames);
+    if (!gt?.visible || !gt.surface) continue;
+    for (const pose of f.poses) {
+      if (!pose.surface) continue;
+      const R = pose.R, tv = pose.t, s = pose.surface, g = gt.surface;
+      let e = 0;
+      for (let k = 0; k < SURFACE_GRID.length; k++) {
+        // App axes (y up, z out of the target) to OpenCV target axes, then into the camera.
+        const x = s[3 * k], y = -s[3 * k + 1], z = -s[3 * k + 2];
+        const cx = R[0] * x + R[1] * y + R[2] * z + tv[0], cy = R[3] * x + R[4] * y + R[5] * z + tv[1], cz = R[6] * x + R[7] * y + R[8] * z + tv[2];
+        const gx = g[3 * k], gy = g[3 * k + 1], gz = g[3 * k + 2];
+        e += Math.hypot(K.fx * (cx / cz - gx / gz), K.fy * (cy / cz - gy / gz));
+      }
+      out.push(e / SURFACE_GRID.length);
+    }
+  }
+  return out;
+}
+
+/** surfaceErrors at the frame offset with the best median (replays can start a frame or two off). */
+export function bestSurfaceErrors(r: HarnessResult, t: Truth, range = 6): number[] {
+  let best = surfaceErrors(r, t, 0), bestMedian = percentile(best, 0.5);
+  for (let o = -range; o <= range; o++) {
+    const e = surfaceErrors(r, t, o), m = percentile(e, 0.5);
+    if (m < bestMedian) { best = e; bestMedian = m; }
+  }
+  return best;
 }
 
 export function percentile(xs: number[], p: number): number {

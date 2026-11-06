@@ -1,6 +1,7 @@
 // three.js adapter. Duck-typed so the library does not depend on three:
 // pass your THREE namespace (for Group) and camera/scene/renderer.
 import type { ImageTracker, FrameEvent } from '../shell/image-tracker';
+import { Surface } from '../shell/surface';
 
 interface Matrix4Like {
   fromArray(a: ArrayLike<number>): unknown;
@@ -34,6 +35,35 @@ interface TextureLike {
   dispose?(): void;
 }
 
+interface AttributeLike {
+  array: ArrayLike<number> & { set(a: ArrayLike<number>, offset?: number): void };
+  needsUpdate: boolean;
+  setUsage?(usage: unknown): unknown;
+}
+
+interface GeometryLike {
+  setAttribute(name: string, attr: unknown): unknown;
+  setIndex(index: unknown): unknown;
+  getAttribute(name: string): AttributeLike;
+  computeBoundingSphere?(): void;
+  dispose?(): void;
+}
+
+/** What surface meshes need from the THREE namespace. */
+interface ThreeSurfaceLike {
+  BufferGeometry: new () => GeometryLike;
+  BufferAttribute: new (array: ArrayLike<number>, itemSize: number) => AttributeLike;
+  Mesh: new (geometry: GeometryLike, material?: unknown) => Object3DLike;
+  DynamicDrawUsage?: unknown;
+}
+
+export interface SurfaceMeshOptions {
+  /** Material for the mesh (three's default if omitted). */
+  material?: unknown;
+  /** Render grid resolution across and down the target (default 32 x 24). */
+  segments?: [number, number];
+}
+
 export interface ThreeAdapterOptions {
   camera: CameraLike;
   scene?: { add(o: unknown): unknown; background?: unknown };
@@ -41,7 +71,7 @@ export interface ThreeAdapterOptions {
    * THREE namespace, used to create anchor groups (and, with syncDisplay,
    * textures for the camera background).
    */
-  THREE?: { Group: new () => Object3DLike; Texture?: new (image?: unknown) => TextureLike; SRGBColorSpace?: string };
+  THREE?: { Group: new () => Object3DLike; Texture?: new (image?: unknown) => TextureLike; SRGBColorSpace?: string } & Partial<ThreeSurfaceLike>;
   /** Called after matrices are updated, inside the video-frame callback. */
   render?: (e: FrameEvent) => void;
   /** Size of the rendered view in CSS pixels (defaults to the video element box). */
@@ -59,6 +89,7 @@ export interface ThreeAdapterOptions {
 export class ThreeAdapter {
   private readonly anchors = new Map<number, Object3DLike>();
   private readonly textures = new Map<unknown, TextureLike>();
+  private readonly meshes: Array<{ index: number; geometry: GeometryLike; segX: number; segY: number }> = [];
   private readonly off: () => void;
 
   constructor(private readonly ar: ImageTracker, private readonly o: ThreeAdapterOptions) {
@@ -87,6 +118,41 @@ export class ThreeAdapter {
     return a;
   }
 
+  /**
+   * A mesh covering target `index` that follows its shape when it bends
+   * (create with the deformable option), parented to the target's anchor.
+   * Texture coordinates map the target image onto it; normals are smooth.
+   */
+  surface(index: number, o: SurfaceMeshOptions = {}): Object3DLike {
+    const T = this.o.THREE;
+    if (!T?.BufferGeometry || !T.BufferAttribute || !T.Mesh) throw new Error('fastar: pass THREE (with BufferGeometry, BufferAttribute and Mesh) in ThreeAdapter options');
+    const meta = this.ar.targets[index];
+    if (!meta) throw new Error(`fastar: no target ${index}`);
+    const [segX, segY] = o.segments ?? [32, 24];
+    const n = (segX + 1) * (segY + 1);
+    const geometry = new T.BufferGeometry();
+    const pos = new T.BufferAttribute(new Float32Array(3 * n), 3), nrm = new T.BufferAttribute(new Float32Array(3 * n), 3);
+    pos.setUsage?.(T.DynamicDrawUsage);
+    nrm.setUsage?.(T.DynamicDrawUsage);
+    geometry.setAttribute('position', pos);
+    geometry.setAttribute('normal', nrm);
+    geometry.setAttribute('uv', new T.BufferAttribute(new Float32Array(2 * n), 2));
+    geometry.setIndex(new T.BufferAttribute(Surface.gridIndices(segX, segY), 1));
+    const W = meta.physicalWidth, H = (W * meta.height) / meta.width;
+    this.fill(geometry, Surface.flat(2, 2, W, H), segX, segY, true);
+    const mesh = new T.Mesh(geometry, o.material);
+    this.anchor(index).add?.(mesh);
+    this.meshes.push({ index, geometry, segX, segY });
+    return mesh;
+  }
+
+  private fill(g: GeometryLike, s: Surface, segX: number, segY: number, uvs = false): void {
+    const pos = g.getAttribute('position'), nrm = g.getAttribute('normal');
+    s.fillGrid(segX, segY, pos.array as Float32Array, nrm.array as Float32Array, uvs ? g.getAttribute('uv').array as Float32Array : null);
+    pos.needsUpdate = nrm.needsUpdate = true;
+    g.computeBoundingSphere?.();
+  }
+
   private update(e: FrameEvent): void {
     const cam = this.o.camera;
     const [w, h] = this.o.viewSize?.() ?? [0, 0];
@@ -102,6 +168,10 @@ export class ThreeAdapter {
         a.matrix.fromArray(p.matrix);
         a.matrixWorldNeedsUpdate = true;
       }
+    }
+    for (const m of this.meshes) {
+      const s = e.poses.get(m.index)?.surface;
+      if (s) this.fill(m.geometry, s, m.segX, m.segY);
     }
     this.o.render?.(e);
   }
@@ -133,5 +203,7 @@ export class ThreeAdapter {
     this.off();
     for (const t of this.textures.values()) t.dispose?.();
     this.textures.clear();
+    for (const m of this.meshes) m.geometry.dispose?.();
+    this.meshes.length = 0;
   }
 }

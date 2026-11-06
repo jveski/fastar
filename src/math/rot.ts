@@ -2,6 +2,8 @@
 // (Hamilton). Rotation perturbations are left (global) unless noted:
 // R = Exp(dtheta) * R_hat.
 
+import { eigenSym } from './linalg';
+
 export type Mat3 = Float64Array;
 export type Vec3 = Float64Array;
 export type Quat = Float64Array;
@@ -222,3 +224,51 @@ export function rotationAngle(a: ArrayLike<number>, b: ArrayLike<number>): numbe
   const c = (M[0] + M[4] + M[8] - 1) * 0.5;
   return Math.atan2(s, c);
 }
+
+/**
+ * Weighted absolute orientation (Horn's quaternion method): the rotation R
+ * (row-major) and translation t minimizing sum w_i |R a_i + t - b_i|^2 over
+ * 3D points a, b ([x, y, z] * n). Returns false if degenerate.
+ */
+export function absoluteOrientation(
+  a: ArrayLike<number>, b: ArrayLike<number>, n: number, w: ArrayLike<number> | null, R: Float64Array, t: Float64Array,
+): boolean {
+  let ws = 0, ax = 0, ay = 0, az = 0, bx = 0, by = 0, bz = 0;
+  for (let i = 0; i < n; i++) {
+    const wi = w ? w[i] : 1;
+    ws += wi;
+    ax += wi * a[3 * i]; ay += wi * a[3 * i + 1]; az += wi * a[3 * i + 2];
+    bx += wi * b[3 * i]; by += wi * b[3 * i + 1]; bz += wi * b[3 * i + 2];
+  }
+  if (!(ws > 0)) return false;
+  ax /= ws; ay /= ws; az /= ws; bx /= ws; by /= ws; bz /= ws;
+  let sxx = 0, sxy = 0, sxz = 0, syx = 0, syy = 0, syz = 0, szx = 0, szy = 0, szz = 0;
+  for (let i = 0; i < n; i++) {
+    const wi = w ? w[i] : 1;
+    const px = a[3 * i] - ax, py = a[3 * i + 1] - ay, pz = a[3 * i + 2] - az;
+    const qx = wi * (b[3 * i] - bx), qy = wi * (b[3 * i + 1] - by), qz = wi * (b[3 * i + 2] - bz);
+    sxx += px * qx; sxy += px * qy; sxz += px * qz;
+    syx += py * qx; syy += py * qy; syz += py * qz;
+    szx += pz * qx; szy += pz * qy; szz += pz * qz;
+  }
+  const N = scratch4x4, vals = scratch4, V = scratchV4;
+  N[0] = sxx + syy + szz; N[1] = syz - szy; N[2] = szx - sxz; N[3] = sxy - syx;
+  N[5] = sxx - syy - szz; N[6] = sxy + syx; N[7] = szx + sxz;
+  N[10] = -sxx + syy - szz; N[11] = syz + szy;
+  N[15] = -sxx - syy + szz;
+  N[4] = N[1]; N[8] = N[2]; N[9] = N[6]; N[12] = N[3]; N[13] = N[7]; N[14] = N[11];
+  eigenSym(N, 4, vals, V);
+  const q = scratchQ;
+  q[0] = V[3]; q[1] = V[7]; q[2] = V[11]; q[3] = V[15];
+  if (!(Math.hypot(q[0], q[1], q[2], q[3]) > 0.5)) return false;
+  mat3FromQuat(q, R);
+  t[0] = bx - (R[0] * ax + R[1] * ay + R[2] * az);
+  t[1] = by - (R[3] * ax + R[4] * ay + R[5] * az);
+  t[2] = bz - (R[6] * ax + R[7] * ay + R[8] * az);
+  return true;
+}
+
+const scratch4x4 = new Float64Array(16);
+const scratch4 = new Float64Array(4);
+const scratchV4 = new Float64Array(16);
+const scratchQ = new Float64Array(4);

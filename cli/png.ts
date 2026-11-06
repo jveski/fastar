@@ -1,5 +1,6 @@
-// Minimal PNG decoder (non-interlaced, 8/16-bit, all colour types) to greyscale.
-import { inflateSync } from 'node:zlib';
+// Minimal PNG decoder (non-interlaced, 8/16-bit, all colour types) to
+// greyscale, and a greyscale encoder.
+import { deflateSync, inflateSync } from 'node:zlib';
 import type { GrayImage } from '../src/image/gray';
 
 export function decodePng(buf: Uint8Array): GrayImage {
@@ -84,4 +85,37 @@ export function decodePng(buf: Uint8Array): GrayImage {
     prev.set(cur);
   }
   return { width, height, data: out };
+}
+
+function crc32(b: Uint8Array): number {
+  let c = ~0;
+  for (const x of b) {
+    c ^= x;
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return ~c >>> 0;
+}
+
+/** Encode an 8-bit greyscale PNG. */
+export function encodeGrayPng(img: GrayImage): Uint8Array {
+  const raw = new Uint8Array((img.width + 1) * img.height);
+  for (let y = 0; y < img.height; y++) raw.set(img.data.subarray(y * img.width, (y + 1) * img.width), y * (img.width + 1) + 1);
+  const chunk = (type: string, data: Uint8Array) => {
+    const out = new Uint8Array(12 + data.length);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(0, data.length);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(data, 8);
+    dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+    return out;
+  };
+  const ihdr = new Uint8Array(13);
+  new DataView(ihdr.buffer).setUint32(0, img.width);
+  new DataView(ihdr.buffer).setUint32(4, img.height);
+  ihdr[8] = 8; // 8-bit greyscale
+  const parts = [Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', new Uint8Array(0))];
+  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
 }

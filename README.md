@@ -36,3 +36,20 @@ ar.onFrame(({ poses }) => {
   if (p?.videoTimeLocked) console.log(p.videoTime); // seconds into the clip
 });
 ```
+
+## Bending targets
+
+A printed page doesn't stay flat. Turn on `deformable` and each pose also carries the page's shape as it curls, flexes or lifts a corner. Any image target works; no special compilation is needed. [Demo](https://jveski.github.io/fastar/demo/paper.html) · [example](examples/paper)
+
+```js
+const ar = await ImageTracker.create({ targets: './targets.bin', deformable: true });
+ar.onFrame(({ poses }) => {
+  const p = poses.get(0);
+  const s = p?.surface?.sample(0.5, 0.5); // middle of the page, in the coordinates of p.matrix
+  // s.position, s.normal, s.tangentU, s.tangentV; p.gravity: down, where motion sensors are available
+});
+```
+
+`surface.positions` holds the mesh itself (`cols` x `rows` vertices from the top-left corner), and `surface.fillGrid()` fills render geometry at any resolution. With three.js, `three.surface(0, { material })` adds a mesh that follows the page, textured like the target image. `deformable: { targets, grid, smoothing }` chooses which targets bend, the mesh resolution (vertices along the long side, default 9) and how much small shape changes are eased.
+
+Find the page while it is roughly flat, then bend it. Smooth bends work; creases and folds don't, and video targets are always rigid. The page needs detail all over: every part of it must be tracked to be shaped.

@@ -17,7 +17,8 @@ import { makeMotionClip } from '../../../src/sim/motion';
 import { compileTarget } from '../../../src/target/compiler';
 import { compileVideoTarget as compileVideo } from '../../../src/target/video-compiler';
 import { encodeTargets } from '../../../src/target/format';
-import { createSceneRenderer, relativePose, scenarios, simulateImu, type Scenario } from '../../../src/sim/scene';
+import { createSceneRenderer, relativePose, scenarios, sheetShape, simulateImu, type Scenario } from '../../../src/sim/scene';
+import { SURFACE_GRID } from '../types';
 import { videoTimeAt } from '../../../src/sim/harness';
 import type { SessionLog } from '../../../src/shell/recorder';
 import type { TargetData } from '../../../src/target/format';
@@ -116,13 +117,19 @@ const fixtures: Fixture[] = [
   { name: 'static', scn: scenarios.static(0.3, 3), poster, posterWidthM: POSTER_W_M, target: imageTarget, targetFile: 'targets-image.bin' },
   { name: 'sweep', scn: scenarios.slowSweep(0.35, 4), poster, posterWidthM: POSTER_W_M, target: imageTarget, targetFile: 'targets-image.bin' },
   { name: 'occlusion', scn: scenarios.occlusion(0.35, 4, 1.5, 0.6), poster, posterWidthM: POSTER_W_M, target: imageTarget, targetFile: 'targets-image.bin' },
+  // A page that starts flat and curls, for bending-target tracking.
+  { name: 'curl', scn: scenarios.flex(-7, 0.5, 0.3, 0.35, 4), poster, posterWidthM: POSTER_W_M, target: imageTarget, targetFile: 'targets-image.bin' },
   {
     name: 'video', scn: scenarios.static(0.6, 3), poster: clip.frame(0), posterWidthM: 0.5,
     target: videoTarget, targetFile: 'targets-video.bin', video: { clip, start: 0 },
   },
 ];
 
-for (const f of fixtures) {
+const only = process.argv.slice(2);
+for (const f of fixtures.filter((x) => !only.length || only.includes(x.name))) {
+  const shape = sheetShape(f.scn, f.poster, f.posterWidthM);
+  const hw = f.posterWidthM / 2, hh = (f.posterWidthM * f.poster.height) / f.poster.width / 2;
+  const q = new Float64Array(3);
   const renderer = createSceneRenderer(f.scn, {
     K, poster: f.poster, posterWidthM: f.posterWidthM,
     textureAt: f.video ? (t) => f.video!.clip.frame(Math.floor(videoTimeAt({ clip: f.video!.clip, start: f.video!.start }, t) * FPS + 1e-6)) : undefined,
@@ -141,6 +148,14 @@ for (const f of fixtures) {
       tv: Array.from(rel.t),
       visible: !(f.scn.occluded?.(t) ?? false),
       videoTime: f.video ? videoTimeAt({ clip: f.video.clip, start: f.video.start }, t) : null,
+      surface: shape ? SURFACE_GRID.flatMap(([u, v]) => {
+        const s = shape(t);
+        const X = (2 * u - 1) * hw, Y = (1 - 2 * v) * hh;
+        if (s) s.point(X, Y, q);
+        else { q[0] = X; q[1] = Y; q[2] = 0; }
+        const R = rel.R, tv = rel.t;
+        return [0, 1, 2].map((r) => R[3 * r] * q[0] + R[3 * r + 1] * q[1] + R[3 * r + 2] * q[2] + tv[r]);
+      }) : undefined,
     });
   }
   makeSession(f, frames, truth);

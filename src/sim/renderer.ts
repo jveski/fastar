@@ -5,6 +5,7 @@ import { pyrDown, PyrScratch } from '../image/pyramid';
 import type { Intrinsics } from '../vision/camera';
 import { Rng } from '../math/rng';
 import { mat3MulAtB, type Mat3, type Vec3 } from '../math/rot';
+import type { SheetShape } from './bend';
 
 export interface RigidPose {
   R: Mat3; // world-from-frame rotation
@@ -23,6 +24,8 @@ export interface TexturedPlane {
   active?: (t: number) => boolean;
   /** Constant intensity instead of texture sampling. */
   flat?: number;
+  /** The plane is a sheet bent into this shape (null while flat). Not with `tile`. */
+  shape?: (t: number) => SheetShape | null;
 }
 
 export interface RenderOptions {
@@ -96,7 +99,7 @@ export class Renderer {
     const dy = (y - K.cy) / K.fy;
     const nPlanes = this.planes.length;
     // Per-plane camera-in-plane transforms for this row.
-    const tf: Array<{ R: Float64Array; o: Float64Array; pl: PreparedPlane; mips: GrayImage[] } | null> = [];
+    const tf: Array<{ R: Float64Array; o: Float64Array; pl: PreparedPlane; mips: GrayImage[]; shape: SheetShape | null } | null> = [];
     for (let k = 0; k < nPlanes; k++) {
       const pl = this.planes[k];
       if (pl.active && !pl.active(t)) { tf.push(null); continue; }
@@ -108,7 +111,7 @@ export class Renderer {
         pp.R[1] * ex + pp.R[4] * ey + pp.R[7] * ez,
         pp.R[2] * ex + pp.R[5] * ey + pp.R[8] * ez,
       );
-      tf.push({ R, o, pl, mips: pl.textureAt ? mipsOf(pl.textureAt(t)) : pl.mips });
+      tf.push({ R, o, pl, mips: pl.textureAt ? mipsOf(pl.textureAt(t)) : pl.mips, shape: pl.shape?.(t) ?? null });
     }
     const row = y * W;
     for (let x = 0; x < W; x++) {
@@ -121,10 +124,18 @@ export class Renderer {
         const px = R[0] * dx + R[1] * dy + R[2];
         const py = R[3] * dx + R[4] * dy + R[5];
         const pz = R[6] * dx + R[7] * dy + R[8];
-        if (Math.abs(pz) < 1e-9) continue;
-        const lam = -o[2] / pz;
-        if (lam <= 0 || lam >= bestL) continue;
-        const X = o[0] + lam * px, Y = o[1] + lam * py;
+        let lam: number, X: number, Y: number, cosv: number;
+        if (f.shape) {
+          if (!f.shape.intersect(o[0], o[1], o[2], px, py, pz, hit)) continue;
+          lam = hit[0]; X = hit[1]; Y = hit[2]; cosv = hit[3];
+          if (lam >= bestL) continue;
+        } else {
+          if (Math.abs(pz) < 1e-9) continue;
+          lam = -o[2] / pz;
+          if (lam <= 0 || lam >= bestL) continue;
+          X = o[0] + lam * px; Y = o[1] + lam * py;
+          cosv = Math.abs(pz) / Math.sqrt(px * px + py * py + pz * pz);
+        }
         const pl = f.pl;
         const tex = pl.texture;
         const mpt = pl.metersPerTexel;
@@ -132,7 +143,6 @@ export class Renderer {
         if (!pl.tile && (u < -0.5 || v < -0.5 || u > tex.width - 0.5 || v > tex.height - 0.5)) continue;
         bestL = lam;
         if (pl.flat !== undefined) { val = pl.flat; continue; }
-        const cosv = Math.abs(pz) / Math.sqrt(px * px + py * py + pz * pz);
         const foot = lam / K.fx / Math.max(cosv, 0.15) / mpt;
         const lev = foot > 1 ? Math.log2(foot) : 0;
         val = sampleTrilinear(f.mips, lev, u, v, !!pl.tile);
@@ -141,6 +151,8 @@ export class Renderer {
     }
   }
 }
+
+const hit = new Float64Array(4);
 
 const mipCache = new WeakMap<GrayImage, GrayImage[]>();
 function mipsOf(tex: GrayImage): GrayImage[] {

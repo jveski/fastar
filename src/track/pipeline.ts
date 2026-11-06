@@ -10,6 +10,7 @@ import { TdEstimator, type TdResult } from '../fusion/td';
 import { rateAt } from '../fusion/predict';
 import { mat3, mat3FromQuat, mat3TVec } from '../math/rot';
 import { RollingShutterEstimator } from './rolling-shutter';
+import { SurfaceTracker, type SurfaceOptions } from '../deform/surface-tracker';
 
 export interface PipelineOptions {
   width: number;
@@ -27,6 +28,9 @@ export interface PipelineOptions {
   /** Estimate the camera-to-IMU offset (and axis signs) from the first seconds of motion. */
   calibrateTd: boolean;
   tracker?: Partial<TrackerOptions>;
+  /** Indices of targets that may bend (printed paper): tracked as deforming surfaces. Not video targets. */
+  deformable?: number[];
+  surface?: Partial<SurfaceOptions>;
   eskf?: Partial<EskfOptions>;
   clock?: Partial<ClockOptions>;
 }
@@ -43,9 +47,19 @@ export const DEFAULT_PIPELINE: Omit<PipelineOptions, 'width' | 'height'> = {
 
 export type TargetStatus = 'tracking' | 'coasting';
 
+export type AnyTracker = TargetTracker | SurfaceTracker;
+
+/** A bending target's shape: mesh vertices in target metres (x right, y down, z into the target). */
+export interface SurfaceState {
+  index: number;
+  cols: number;
+  rows: number;
+  vertices: Float64Array;
+}
+
 export interface TargetSlot {
   index: number;
-  tracker: TargetTracker;
+  tracker: AnyTracker;
   eskf: Eskf;
   status: TargetStatus;
   /** Camera time of the last successful vision update. */
@@ -282,9 +296,10 @@ export class Pipeline {
         s.tracker.rsY = use ? rs.rsY : 0;
       }
       const tb = now();
-      const clock = this.clocks.get(s.index);
+      const vt = s.tracker instanceof TargetTracker ? s.tracker : null;
+      const clock = vt ? this.clocks.get(s.index) : undefined;
       const had = s.tracker.n;
-      if (clock) this.setVideoTime(s.tracker, clock, tCam);
+      if (clock) this.setVideoTime(vt!, clock, tCam);
       let ok: boolean;
       // A video cut retires most tracked points: re-seed from the new shot's.
       const thin = clock && (s.tracker.n < s.tracker.o.minInliers + 4 || s.tracker.n < 0.4 * had);
@@ -302,19 +317,19 @@ export class Pipeline {
       // Video: the tracked points fit, but hardly any other point can be
       // found where this time and pose put it. Search both again.
       let restarted = false;
-      if (ok && clock && s.tracker.starved) {
-        const inl = this.searchTime(clock, s.tracker, cur, tCam, s.tracker.R, s.tracker.t, Flips.Careful);
-        if (inl >= 1.5 * s.tracker.inliers) {
-          this.setVideoTime(s.tracker, clock, tCam);
+      if (ok && clock && vt!.starved) {
+        const inl = this.searchTime(clock, vt!, cur, tCam, vt!.R, vt!.t, Flips.Careful);
+        if (inl >= 1.5 * vt!.inliers) {
+          this.setVideoTime(vt!, clock, tCam);
           ok = s.tracker.init(cur, this.Rs, this.ts);
           restarted = ok;
         }
       }
-      if (ok && clock) this.probeClock(clock, s.tracker, cur, tCam, id);
+      if (ok && clock) this.probeClock(clock, vt!, cur, tCam, id);
       const tc = now();
       trackT += tc - tb;
       klt += s.tracker.timings.klt; ncc += s.tracker.timings.ncc; solve += s.tracker.timings.solve;
-      if (ok && imu && this.tdCalibrated && s === this.slots[0]) this.rollingShutter.observe(s.tracker);
+      if (ok && vt && imu && this.tdCalibrated && s === this.slots[0]) this.rollingShutter.observe(vt);
       if (imu && !this.tdCalibrated && this.o.calibrateTd && s === this.slots[0]) {
         if (ok) this.tdEstimator.addVision(tCam, s.tracker.R);
         else this.tdEstimator.gap();
@@ -423,7 +438,7 @@ export class Pipeline {
   }
 
   /** Start the filter over at the tracker's pose at time t. */
-  private restartFilter(eskf: Eskf, t: number, tracker: TargetTracker): void {
+  private restartFilter(eskf: Eskf, t: number, tracker: AnyTracker): void {
     const imu = this.o.useImu ? this.imu : null;
     eskf.initialize(t, tracker.R, tracker.t, tracker.cov, this.o.useImu ? this.upVector() : null, this.td, this.bg);
     if (this.tdCalibrated) eskf.enableTd(this.td);
@@ -495,10 +510,10 @@ export class Pipeline {
       if (res.time) this.clocks.get(res.target)?.addRanges(tFrame, res.time.ranges);
       return null;
     }
-    const tracker = s?.tracker ?? new TargetTracker(this.targets[res.target], this.K, this.o.tracker);
+    const tracker = s?.tracker ?? this.createTracker(res.target);
     let clock = this.clocks.get(res.target);
     let R0: ArrayLike<number> = res.R, t0: ArrayLike<number> = res.t, searched = false;
-    if (tracker.video) {
+    if (tracker instanceof TargetTracker && tracker.video) {
       const vm = tracker.video;
       if (!clock) this.clocks.set(res.target, (clock = new VideoClock(vm.duration, vm.fps, this.o.clock)));
       if (res.time) clock.addRanges(tFrame, res.time.ranges);
@@ -522,7 +537,7 @@ export class Pipeline {
       }
     }
     if (!tracker.init(this.ring[k], R0, t0)) return null;
-    if (clock && searched) this.probeClock(clock, tracker, this.ring[k], tFrame, 0);
+    if (clock && searched && tracker instanceof TargetTracker) this.probeClock(clock, tracker, this.ring[k], tFrame, 0);
     const eskf = s?.eskf ?? new Eskf({ ...this.o.eskf, useImu: this.o.useImu });
     const imu = this.o.useImu ? this.imu : null;
     if (!s && this.slots.length === 0) this.tdEstimator.gap();
@@ -532,7 +547,7 @@ export class Pipeline {
       const lk = this.ringSlot(latest);
       const tL = this.ringTime[lk];
       eskf.poseAt(tL, this.R, this.t, imu);
-      if (clock) this.setVideoTime(tracker, clock, tL);
+      if (clock && tracker instanceof TargetTracker) this.setVideoTime(tracker, clock, tL);
       if (!tracker.track(this.ring[k], this.ring[lk], this.R, this.t)) return null;
       eskf.updatePose(tL, tracker.R, tracker.t, tracker.cov, imu);
     }
@@ -545,6 +560,22 @@ export class Pipeline {
     s.status = 'tracking';
     s.lastSeen = this.ringTime[this.ringSlot(latest)];
     return isNew ? res.target : null;
+  }
+
+  private createTracker(index: number): AnyTracker {
+    const T = this.targets[index];
+    if (!T.video && this.o.deformable?.includes(index)) return new SurfaceTracker(T, this.K, this.o.tracker, this.o.surface);
+    return new TargetTracker(T, this.K, this.o.tracker);
+  }
+
+  /** Shapes of the bending targets tracked in the last frame. */
+  surfaces(): SurfaceState[] {
+    const out: SurfaceState[] = [];
+    for (const s of this.slots) {
+      const tr = s.tracker;
+      if (tr instanceof SurfaceTracker && s.status === 'tracking') out.push({ index: s.index, cols: tr.mesh.nx, rows: tr.mesh.ny, vertices: tr.shape });
+    }
+    return out;
   }
 
   isVisible(s: TargetSlot, tCam: number): boolean {

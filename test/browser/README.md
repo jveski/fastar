@@ -37,8 +37,9 @@ exists on the repository's default branch.
 ## What is covered
 
 - **Replay** of deterministic rendered scenes (`static`, `sweep`, `occlusion`,
-  `video`) through `start({ replay: { log, video } })`, with per-frame ground
-  truth and overlay accuracy assertions.
+  `video`, and `curl`, a page that bends, tracked with `deformable`) through
+  `start({ replay: { log, video } })`, with per-frame ground truth and overlay
+  (or surface) accuracy assertions.
 - **Live stream** input from a canvas `captureStream`, including `syncDisplay`.
 - **`getUserMedia`** via Chromium's fake camera file (`camera-chromium`).
 - **Sensors**: synthetic `devicemotion` fed through `MotionSensors`, plus the

@@ -2,7 +2,7 @@
 // public API with a synthetic camera stream, a recorded session, or a real
 // getUserMedia camera. Results are exposed as JSON for Playwright/Appium.
 import type { FrameEvent, ImageTracker, SessionLog } from '../../../src/index';
-import type { FrameSample, HarnessResult, PoseSample, StatsSample, Truth } from '../types';
+import { SURFACE_GRID, type FrameSample, type HarnessResult, type PoseSample, type StatsSample, type Truth } from '../types';
 
 const LIB_URL = '/fastar.js';
 // Fixtures are rendered with the default 63° horizontal FOV. Real phones get a
@@ -43,6 +43,7 @@ const OffscreenCtor = (globalThis as { OffscreenCanvas?: typeof OffscreenCanvas 
 const useImu = p.get('useImu') !== '0';
 const runOverride = Number(p.get('runMs') ?? 0);
 const targetFile = p.get('target') ?? 'targets-image.bin';
+const deformable = p.get('deformable') === '1';
 const useTruth = p.get('truth') !== '0';
 // Slow devices can play the clip slower to give acquisition more wall time;
 // truth is keyed by mediaTime, so the comparison is unchanged.
@@ -164,6 +165,7 @@ function attach(ar: ImageTracker, frames: FrameSample[], events: HarnessResult['
         confidence: pose.confidence,
         videoTime: pose.videoTime ?? null,
         locked: !!pose.videoTimeLocked,
+        surface: pose.surface ? SURFACE_GRID.flatMap(([u, v]) => Array.from(pose.surface!.sample(u, v).position)) : undefined,
       });
     }
     frames.push({
@@ -252,7 +254,7 @@ function sessionMs(log: SessionLog): number {
 
 async function startReplay(log: SessionLog, ms: number): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile) });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -276,7 +278,7 @@ async function startReplay(log: SessionLog, ms: number): Promise<void> {
 
 async function startLive(): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile) });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -310,7 +312,7 @@ async function startLive(): Promise<void> {
 
 async function startRecord(): Promise<void> {
   const { ImageTracker } = await loadFastar();
-  const ar = await ImageTracker.create({ targets: fixture(targetFile) });
+  const ar = await ImageTracker.create({ targets: fixture(targetFile), deformable });
   const frames: FrameSample[] = [];
   const events: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar, frames, events);
@@ -329,7 +331,7 @@ async function startRecord(): Promise<void> {
   if (!session.video) throw new Error('MediaRecorder produced no video');
 
   const blobUrl = URL.createObjectURL(session.video);
-  const ar2 = await ImageTracker.create({ targets: fixture(targetFile) });
+  const ar2 = await ImageTracker.create({ targets: fixture(targetFile), deformable });
   const frames2: FrameSample[] = [];
   const events2: HarnessResult['events'] = { found: [], lost: [] };
   attach(ar2, frames2, events2);

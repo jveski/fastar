@@ -14,6 +14,8 @@ import type { EskfOptions } from '../fusion/eskf';
 import type { TrackerOptions } from '../track/tracker';
 import type { ClockState, FrameTargetInfo } from '../track/pipeline';
 import { Recorder, type SessionLog } from './recorder';
+import { Surface, SurfaceFeed } from './surface';
+import { AccelSigns } from '../fusion/gravity';
 
 export interface CreateOptions {
   /** URL of a compiled targets file, or its bytes. */
@@ -32,6 +34,24 @@ export interface CreateOptions {
    * delayed, and small corrections pass through). false turns it off.
    */
   smoothing?: Partial<SmoothingOptions> | false;
+  /**
+   * Track targets that bend, like printed paper: each pose then carries the
+   * target's shape (Pose.surface). true for every image target, or choose
+   * targets and options. Video targets are always tracked as rigid.
+   */
+  deformable?: boolean | DeformableOptions;
+}
+
+export interface DeformableOptions {
+  /** Indices of the targets that bend (default: every image target). */
+  targets?: number[];
+  /**
+   * Mesh vertices along each target's long side (default 9; cells stay
+   * roughly square). More follows tighter bends but needs more texture.
+   */
+  grid?: number;
+  /** Share of a small shape change eased over to the next frame (0 to 1, default 0.5; 0 = off). */
+  smoothing?: number;
 }
 
 export interface StartOptions {
@@ -72,6 +92,13 @@ export interface Pose {
   videoTimeStd?: number;
   /** videoTime is good to a fraction of a video frame. */
   videoTimeLocked?: boolean;
+  /** Bending targets: the target's shape in this frame, in the coordinates of `matrix`. */
+  surface?: Surface;
+  /**
+   * Unit vector pointing down (along gravity) in the coordinates of
+   * `matrix`, when motion sensors are available.
+   */
+  gravity?: Float32Array;
 }
 
 export interface VideoTime {
@@ -206,11 +233,20 @@ export class ImageTracker {
   private displayImageNext = 0;
   /** Capture time of the newest tracked frame (ms). */
   private lastResultTime = -Infinity;
+  /** Targets tracked as bending surfaces, and their shapes. */
+  private readonly deformable: number[];
+  private readonly surfaces = new Map<number, SurfaceFeed>();
+  private readonly up = new Float64Array(3);
+  /** The accelerometer's sign convention, from its own readings (for Pose.gravity). */
+  private readonly accelSigns = new AccelSigns();
 
   private constructor(buffer: ArrayBuffer, o: CreateOptions) {
     this.buffer = buffer;
     this.o = { maxTrack: 1, showThreshold: 0.5, hideThreshold: 0.2, ...o };
     this.targets = decodeTargets(buffer.slice(0)).map((t) => t.meta);
+    const d = o.deformable;
+    const chosen = !d ? [] : d === true || !d.targets ? this.targets.map((_, i) => i) : d.targets;
+    this.deformable = chosen.filter((i) => this.targets[i] && !this.targets[i].video);
     this.recorder = new Recorder(this);
   }
 
@@ -314,6 +350,8 @@ export class ImageTracker {
     this.smoothers.clear();
     this.shown.clear();
     this.clocks.clear();
+    this.surfaces.clear();
+    this.accelSigns.reset();
     this.displayQueue.length = 0;
     this.lastResultTime = -Infinity;
     this.frameClock = null;
@@ -402,6 +440,8 @@ export class ImageTracker {
       type: 'init', targets: this.buffer.slice(0), width, height, K, maxTrack: this.o.maxTrack, useImu,
       td: cal?.td, tdCalibrated: !!cal, axisSigns: cal?.axisSigns, mainTimeOrigin: performance.timeOrigin,
       acquirePort: ch.port1, eskf: this.o.filter, tracker: this.o.tracker, calibrateFocal: !this.replayLog && this.storedFocal() === null,
+      deformable: this.deformable,
+      surface: typeof this.o.deformable === 'object' && this.o.deformable.grid ? { grid: this.o.deformable.grid } : undefined,
     };
     this.tracker.postMessage(init, [init.targets, ch.port1]);
     this.tracker.onmessage = (e) => this.onWorker(e.data as FromTracker);
@@ -440,6 +480,7 @@ export class ImageTracker {
         if (m.axisSigns.some((v) => v < 0)) {
           this.imu.scaleAxes(m.axisSigns);
           for (let k = 0; k < 3; k++) this.axisSigns[k] *= m.axisSigns[k];
+          this.accelSigns.reset();
         }
         return;
       case 'focal':
@@ -475,9 +516,19 @@ export class ImageTracker {
     }
     for (const r of m.targets) this.confidence.set(r.index, r.confidence);
     for (const c of m.clocks ?? []) this.clocks.set(c.index, c);
+    for (const s of m.surfaces ?? []) {
+      let f = this.surfaces.get(s.index);
+      if (!f || f.cols !== s.cols || f.rows !== s.rows) {
+        const meta = this.targets[s.index], keep = typeof this.o.deformable === 'object' ? this.o.deformable.smoothing ?? 0.5 : 0.5;
+        f = new SurfaceFeed(s.cols, s.rows, meta.physicalWidth, (meta.physicalWidth * meta.height) / meta.width, keep);
+        this.surfaces.set(s.index, f);
+      }
+      f.push(m.t, s.vertices);
+    }
     for (const i of m.lost) {
       this.predictors.delete(i);
       this.confidence.set(i, 0);
+      this.surfaces.delete(i);
     }
     // Show/hide hysteresis on filter confidence.
     for (const [i, c] of this.confidence) {
@@ -573,6 +624,17 @@ export class ImageTracker {
         R: this.R.slice(), t: this.t.slice(),
         confidence: this.confidence.get(i) ?? 0,
       };
+      const surface = this.surfaces.get(i)?.at(captureTime);
+      if (surface) pose.surface = surface;
+      if (this.upInCamera()) {
+        // Down in target axes (R^T applied to -up), then to the app's y up, z out of the target.
+        const R = this.R, u = this.up;
+        pose.gravity = Float32Array.of(
+          -(R[0] * u[0] + R[3] * u[1] + R[6] * u[2]),
+          R[1] * u[0] + R[4] * u[1] + R[7] * u[2],
+          R[2] * u[0] + R[5] * u[1] + R[8] * u[2],
+        );
+      }
       const vt = this.videoTimeAt(i, captureTime);
       if (vt) {
         pose.videoTime = vt.time;
@@ -590,6 +652,24 @@ export class ImageTracker {
       image,
     };
     this.frameListeners.forEach((cb) => cb(ev));
+  }
+
+  /** Unit up direction in camera axes from the latest accelerometer samples (into this.up), if any. */
+  private upInCamera(): boolean {
+    const imu = this.imu;
+    let sx = 0, sy = 0, sz = 0, n = 0;
+    for (let i = imu.count - 1; i >= 0 && n < 8; i--) {
+      const s = imu.slot(i);
+      if (!imu.hasAccel[s]) continue;
+      sx += imu.a[3 * s]; sy += imu.a[3 * s + 1]; sz += imu.a[3 * s + 2];
+      n++;
+    }
+    const m = Math.hypot(sx, sy, sz);
+    if (!n || !(m > 0)) return false;
+    this.accelSigns.observe(imu);
+    const g = this.accelSigns.signs;
+    this.up[0] = (g[0] * sx) / m; this.up[1] = (g[1] * sy) / m; this.up[2] = (g[2] * sz) / m;
+    return true;
   }
 
   /** syncDisplay: copy the presented frame and hold it until it is tracked. */

@@ -1,4 +1,9 @@
 // JSON shapes shared by the browser harness and the Playwright assertions.
+
+/** Texture coordinates [u, v] at which bending targets' surfaces are sampled and checked. */
+export const SURFACE_GRID: Array<[number, number]> = [];
+for (let j = 0; j < 4; j++) for (let i = 0; i < 5; i++) SURFACE_GRID.push([0.1 + 0.2 * i, 0.1 + (0.8 * j) / 3]);
+
 export interface PoseSample {
   index: number;
   R: number[];
@@ -6,6 +11,8 @@ export interface PoseSample {
   confidence: number;
   videoTime: number | null;
   locked: boolean;
+  /** Bending targets: pose.surface at SURFACE_GRID, [x, y, z] each (target axes of pose.matrix). */
+  surface?: number[];
 }
 
 export interface FrameSample {
@@ -84,6 +91,8 @@ export interface TruthFrame {
   tv: number[];
   visible: boolean;
   videoTime: number | null;
+  /** Bent sheets: SURFACE_GRID points in camera coordinates (OpenCV, m), [x, y, z] each. */
+  surface?: number[];
 }
 
 export interface Truth {

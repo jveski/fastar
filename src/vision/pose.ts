@@ -24,7 +24,8 @@ export const DEFAULT_POSE_OPTIONS: PoseSolverOptions = {
 };
 
 /**
- * Gauss-Newton on SE(3) for planar targets (object points have z = 0),
+ * Gauss-Newton on SE(3) for planar targets (object points have z = 0, or the
+ * given z for a bent one),
  * minimizing reprojection error with Tukey weights. Perturbation:
  * R = Exp(dtheta) R_hat, t = t_hat + dt, state order [dtheta, dt].
  * Output covariance: sigma^2 (J^T W J)^-1 (6x6, same ordering).
@@ -52,17 +53,18 @@ export class PoseSolver {
   }
 
   /**
-   * Refine (R, t) in place. obj: [X, Y] per point in metres (z = 0); img:
-   * [u, v] in pixels. Returns false if the problem is degenerate.
+   * Refine (R, t) in place. obj: [X, Y] per point in metres (z = 0 unless
+   * `z` gives it); img: [u, v] in pixels. Returns false if the problem is
+   * degenerate.
    */
-  solve(K: Intrinsics, obj: Float32Array, img: Float32Array, n: number, R: Float64Array, t: Float64Array): boolean {
+  solve(K: Intrinsics, obj: Float32Array, img: Float32Array, n: number, R: Float64Array, t: Float64Array, z?: Float32Array): boolean {
     if (n < 4) return false;
     const { maxIter, tol } = this.opts;
     let ok = true;
     this.iterations = 0;
     for (let it = 0; it < maxIter; it++) {
       this.iterations = it + 1;
-      if (!this.linearize(K, obj, img, n, R, t)) { ok = false; break; }
+      if (!this.linearize(K, obj, img, n, R, t, z)) { ok = false; break; }
       const H = this.Htmp, g = this.col;
       H.set(this.H);
       for (let i = 0; i < 6; i++) g[i] = -this.g[i];
@@ -76,7 +78,7 @@ export class PoseSolver {
     }
     if (!ok) return false;
     // Final linearization at the solution gives weights, sigma and covariance.
-    if (!this.linearize(K, obj, img, n, R, t)) return false;
+    if (!this.linearize(K, obj, img, n, R, t, z)) return false;
     let wsum = 0, wr2 = 0, inl = 0, inlr2 = 0;
     const w = this.weights, r = this.residuals;
     for (let i = 0; i < n; i++) {
@@ -99,17 +101,18 @@ export class PoseSolver {
   }
 
   /** Build weighted normal equations H, g at (R, t); fills residuals/weights. */
-  private linearize(K: Intrinsics, obj: Float32Array, img: Float32Array, n: number, R: Float64Array, t: Float64Array): boolean {
+  private linearize(K: Intrinsics, obj: Float32Array, img: Float32Array, n: number, R: Float64Array, t: Float64Array, z?: Float32Array): boolean {
     const { fx, fy, cx, cy } = K;
     const r0 = R[0], r1 = R[1], r3 = R[3], r4 = R[4], r6 = R[6], r7 = R[7];
+    const r2 = R[2], r5 = R[5], r8 = R[8];
     const t0 = t[0], t1 = t[1], t2 = t[2];
     const res = this.residuals, norms = this.norms, w = this.weights;
     let valid = 0;
     for (let i = 0; i < n; i++) {
-      const X = obj[2 * i], Y = obj[2 * i + 1];
-      const pz = r6 * X + r7 * Y + t2;
+      const X = obj[2 * i], Y = obj[2 * i + 1], Z = z ? z[i] : 0;
+      const pz = r6 * X + r7 * Y + r8 * Z + t2;
       if (pz <= 1e-6) { res[i] = Infinity; continue; }
-      const px = r0 * X + r1 * Y + t0, py = r3 * X + r4 * Y + t1;
+      const px = r0 * X + r1 * Y + r2 * Z + t0, py = r3 * X + r4 * Y + r5 * Z + t1;
       const iz = 1 / pz;
       const ex = fx * px * iz + cx - img[2 * i], ey = fy * py * iz + cy - img[2 * i + 1];
       const nr = Math.sqrt(ex * ex + ey * ey);
@@ -137,8 +140,8 @@ export class PoseSolver {
       const wi = q * q;
       w[i] = wi;
       wcount++;
-      const X = obj[2 * i], Y = obj[2 * i + 1];
-      const ax = r0 * X + r1 * Y, ay = r3 * X + r4 * Y, az = r6 * X + r7 * Y;
+      const X = obj[2 * i], Y = obj[2 * i + 1], Z = z ? z[i] : 0;
+      const ax = r0 * X + r1 * Y + r2 * Z, ay = r3 * X + r4 * Y + r5 * Z, az = r6 * X + r7 * Y + r8 * Z;
       const px = ax + t0, py = ay + t1, pz = az + t2;
       const iz = 1 / pz;
       const ex = fx * px * iz + cx - img[2 * i], ey = fy * py * iz + cy - img[2 * i + 1];

@@ -8,7 +8,7 @@ import type { VideoClip } from './motion';
 import type { TargetData } from '../target/format';
 import { Acquirer } from '../track/acquire';
 import { Pipeline, type PipelineOptions } from '../track/pipeline';
-import { createSceneRenderer, relativePose, simulateImu, type ImuSimOptions, type Scenario } from './scene';
+import { createSceneRenderer, relativePose, sheetShape, simulateImu, type ImuSimOptions, type Scenario } from './scene';
 import type { RenderOptions } from './renderer';
 import { mat3MulAtB, so3Log, mat3, vec3, rotationAngle } from '../math/rot';
 import { projectPoint } from '../vision/pose';
@@ -82,6 +82,15 @@ export interface FrameLog {
   videoTruth: number;
   videoTime: number;
   videoLocked: boolean;
+  /**
+   * Bent or flat sheet: mean image distance (px) and camera-frame distance
+   * (m) between where the estimate puts a grid of target points and where
+   * they are. A rigid tracker counts as estimating a flat sheet.
+   */
+  surfaceErrPx: number;
+  surfaceErr3d: number;
+  /** Largest image distance (px) over the grid. */
+  surfaceMaxPx: number;
 }
 
 export interface RunResult {
@@ -108,8 +117,9 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
   const v = o.video;
   const target = o.target ?? (v ? v.target ?? videoTargetFor(v.clip, o.posterWidthM) : targetFor(o.poster, o.posterWidthM));
   const poster = v ? v.clip.frame(0) : o.poster;
+  const shape = sheetShape(scn, poster, o.posterWidthM);
   const renderer = createSceneRenderer(scn, {
-    K, poster, posterWidthM: o.posterWidthM,
+    K, poster, posterWidthM: o.posterWidthM, shape: shape ?? undefined,
     // The epsilon keeps rounding from flipping between frames at a frame change.
     textureAt: v ? (t) => v.clip.frame(Math.floor(videoTimeAt(v, t) * v.clip.fps + 1e-6)) : undefined,
   });
@@ -122,6 +132,7 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
   let acquisitions = 0, attempts = 0, firstLock = NaN;
   const corners = [-1, -1, 1, -1, 1, 1, -1, 1].map((c, i) =>
     i % 2 === 0 ? (c * o.posterWidthM) / 2 : (c * o.posterWidthM * (poster.height / poster.width)) / 2);
+  const grid = surfaceGrid(o.posterWidthM, (o.posterWidthM * poster.height) / poster.width);
   const estR = mat3(), estT = vec3();
   const pe = new Float32Array(2), pg = new Float32Array(2);
   const nFrames = Math.floor(scn.duration * fps);
@@ -163,6 +174,13 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
       tErr = Math.hypot(estT[0] - gt.t[0], estT[1] - gt.t[1], estT[2] - gt.t[2]);
       rErr = (rotationAngle(estR, gt.R) * 180) / Math.PI;
     }
+    let surfPx = NaN, surf3d = NaN, surfMax = NaN;
+    if (visible && s) {
+      const e = surfaceError(K, grid, estR, estT, s.tracker as SurfaceLike, gt.R, gt.t, shape?.(tTrue) ?? null);
+      surfPx = e.px;
+      surf3d = e.m;
+      surfMax = e.max;
+    }
     const info = res.targets.find((x) => x.index === 0);
     frames.push({
       t: tTrue, tCam, visible, status: s?.status ?? 'none', overlayErrPx: overlay, transErr: tErr, rotErrDeg: rErr,
@@ -170,9 +188,48 @@ export function runScenario(scn: Scenario, o: RunOptions): RunResult {
       videoTruth: v ? videoTimeAt(v, tTrue) : NaN,
       videoTime: info?.videoTime ?? NaN,
       videoLocked: !!info?.videoLocked,
+      surfaceErrPx: surfPx,
+      surfaceErr3d: surf3d,
+      surfaceMaxPx: surfMax,
     });
   }
   return { frames, acquisitions, acquireAttempts: attempts, firstLockTime: firstLock, pipeline };
+}
+
+/** A tracker that estimates the target's shape: target-frame point of flat target point (X, Y). */
+interface SurfaceLike {
+  surfacePoint?(X: number, Y: number, out: Float64Array): void;
+}
+
+/** Flat target points (m) on a 9 x 7 grid over 90% of the sheet. */
+function surfaceGrid(w: number, h: number): Float64Array {
+  const out: number[] = [];
+  for (let j = 0; j < 7; j++) for (let i = 0; i < 9; i++) out.push(0.9 * w * (i / 8 - 0.5), 0.9 * h * (j / 6 - 0.5));
+  return Float64Array.from(out);
+}
+
+function surfaceError(
+  K: Intrinsics, grid: Float64Array, R: Float64Array, t: Float64Array, tr: SurfaceLike,
+  Rg: Float64Array, tg: Float64Array, shape: { point(X: number, Y: number, out: Float64Array): void } | null,
+): { px: number; m: number; max: number } {
+  const p = new Float64Array(3), q = new Float64Array(3);
+  let px = 0, m = 0, n = 0, max = 0;
+  for (let k = 0; k < grid.length; k += 2) {
+    const X = grid[k], Y = grid[k + 1];
+    if (tr.surfacePoint) tr.surfacePoint(X, Y, p);
+    else { p[0] = X; p[1] = Y; p[2] = 0; }
+    if (shape) shape.point(X, Y, q);
+    else { q[0] = X; q[1] = Y; q[2] = 0; }
+    const ex = R[0] * p[0] + R[1] * p[1] + R[2] * p[2] + t[0], ey = R[3] * p[0] + R[4] * p[1] + R[5] * p[2] + t[1], ez = R[6] * p[0] + R[7] * p[1] + R[8] * p[2] + t[2];
+    const gx = Rg[0] * q[0] + Rg[1] * q[1] + Rg[2] * q[2] + tg[0], gy = Rg[3] * q[0] + Rg[4] * q[1] + Rg[5] * q[2] + tg[1], gz = Rg[6] * q[0] + Rg[7] * q[1] + Rg[8] * q[2] + tg[2];
+    if (ez <= 0 || gz <= 0) continue;
+    const e = Math.hypot(K.fx * (ex / ez - gx / gz), K.fy * (ey / ez - gy / gz));
+    px += e;
+    if (e > max) max = e;
+    m += Math.hypot(ex - gx, ey - gy, ez - gz);
+    n++;
+  }
+  return n ? { px: px / n, m: m / n, max } : { px: NaN, m: NaN, max: NaN };
 }
 
 /** Std of translation (m) and rotation (deg) of the estimates over a window: static jitter. */
