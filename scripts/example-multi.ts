@@ -1,4 +1,4 @@
-// Generates the multi-target example in examples/multi: four different
+// Generates the multi-target demo in site/demo/multi: four different
 // looping "marbled ink" clips (clips/<name>.mp4) to show side by side on one
 // screen, one targets.bin holding all four as video targets, and per clip
 // the content its overlay loads when the clip is found (clips/<name>.json:
@@ -8,7 +8,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { makeShowcaseClip } from '../src/sim/showcase';
 
-const OUT = 'examples/multi';
+const OUT = 'site/demo/multi';
 // Each clip is shown about 14 cm wide (a quarter of a laptop screen); change to your tiles' width.
 const WIDTH_M = 0.14;
 // Fewer points on screen at a time keep each target, and targets.bin, small.

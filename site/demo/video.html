@@ -23,16 +23,15 @@
     <header>
       <a href="https://github.com/jveski/fastar">fastar</a>
       <a href="../compile.html">Compiler</a>
-      <a href="./">Demo</a>
-      <a href="video.html" aria-current="page">Video demo</a>
-      <a href="paper.html">Paper demo</a>
+      <a href="demos.html">All demos</a>
     </header>
     <main>
       <h1>Video demo</h1>
       <p class="muted">
         A cube on a video that never holds still. The whole picture churns, swirls and changes colour all the time,
         and nothing is sent between the two devices: the camera alone finds the screen and the moment the clip is at.
-        Play the clip full screen on another device (double-click it), then tap Start on your phone and point it at the screen.
+        <a href="video/screen.html" target="_blank" rel="noopener">Play the clip full screen</a> on another device,
+        then tap Start on your phone and point it at the screen.
         Once the time is locked, the cube turns with the swirl beneath it, grows and shrinks with it, and changes colour with the clip.
       </p>
       <div class="row">
@@ -42,7 +41,7 @@
       <video id="clip" autoplay loop muted playsinline></video>
       <p class="muted">
         <a href="https://github.com/jveski/fastar/blob/main/site/demo/video.html">View this page's source</a>
-        for a complete example.
+        and <a href="https://github.com/jveski/fastar/blob/main/site/demo/video/overlay.js">the overlay</a> for a complete example.
       </p>
     </main>
 
@@ -55,21 +54,12 @@
 
     <script type="module">
       import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter } from '../fastar.js';
+      import { createOverlay } from './video/overlay.js';
 
       const $ = (id) => document.getElementById(id);
-      // The built site (dist/site) has the library and the clip's files next to this page;
-      // served from the repository root (site/demo/video.html), they come from dist/ and examples/.
-      const fromSource = /\/site\/demo\//.test(location.pathname);
       const at = (path) => new URL(path, location.href).href;
-      const lib = at(fromSource ? '../../dist/fastar.js' : '../fastar.js');
-      const assets = fromSource ? '../../examples/video/' : 'video/';
-      const [{ ImageTracker, ThreeAdapter }, { createOverlay }] = await Promise.all([import(lib), import(at(assets + 'overlay.js'))]).catch((err) => {
-        $('error').textContent = fromSource
-          ? `Could not load ${lib} (run npm run build first): ${err.message}`
-          : `Could not load the demo: ${err.message}`;
-        throw err;
-      });
-      $('clip').src = at(assets + 'clip.mp4');
+      $('clip').src = './video/clip.mp4';
       $('clip').ondblclick = () => $('clip').requestFullscreen?.();
 
       const canvas = $('gl');
@@ -88,8 +78,11 @@
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
 
       const [ar, sceneInfo] = await Promise.all([
-        ImageTracker.create({ targets: at(assets + 'targets.bin') }),
-        fetch(at(assets + 'scene.json')).then((r) => r.json()),
+        ImageTracker.create({ targets: at('./video/targets.bin') }),
+        fetch('./video/scene.json').then((r) => {
+          if (!r.ok) throw new Error(`Scene: HTTP ${r.status}`);
+          return r.json();
+        }),
       ]).catch((err) => {
         $('error').textContent = `Could not load the targets: ${err.message}`;
         throw err;
@@ -117,14 +110,19 @@
       $('start').disabled = false;
       $('start').onclick = async () => {
         $('error').textContent = '';
+        $('stop').disabled = true;
         document.body.classList.add('running');
         $('clip').pause();
         try {
           await ar.start({ video: $('video'), requestMotionPermission: true, syncDisplay: true });
         } catch (err) {
+          ar.stop();
           document.body.classList.remove('running');
           $('error').textContent = err.message;
-          throw err;
+          $('clip').play().catch(() => {});
+          return;
+        } finally {
+          $('stop').disabled = false;
         }
         timer = setInterval(() => {
           const s = ar.stats;
@@ -140,7 +138,7 @@
         clearInterval(timer);
         $('status').textContent = '';
         document.body.classList.remove('running');
-        $('clip').play();
+        $('clip').play().catch(() => {});
       };
     </script>
   </body>

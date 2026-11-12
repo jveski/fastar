@@ -16,6 +16,7 @@
     <script>
       document.body.onclick = () => {
         document.documentElement.requestFullscreen?.();
+        document.querySelector('video').play();
         document.getElementById('hint').remove();
       };
     </script>

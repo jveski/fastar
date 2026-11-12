@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Timecode player – fastar</title>
+    <link rel="stylesheet" href="../../style.css" />
+  </head>
+  <body>
+    <header><a href="../demos.html">fastar demos</a></header>
+    <main>
+      <h1>Timecode player</h1>
+      <p>Play here and <a id="receiver" href="../timecode.html">listen on another device</a>.
+        The player generates one minute of 19–20 kHz timecode in the browser, starting at set time zero.</p>
+      <p class="warn">Use speakers that reach 20 kHz. Start at low volume; do not turn it up just because
+        you cannot hear it. Many laptop and phone speakers cannot reproduce this band.</p>
+      <div class="row"><button id="play">Play</button><button id="stop" class="secondary" disabled>Stop</button></div>
+      <p id="status" role="status">Stopped</p>
+      <p><a href="https://github.com/jveski/fastar/blob/main/site/demo/timecode/screen.html">View source</a></p>
+    </main>
+    <script type="module">
+      import { TimecodeEncoder } from '../../fastar.js';
+
+      const $ = (id) => document.getElementById(id);
+      const key = new URLSearchParams(location.search).get('key') ?? 'my-set';
+      $('receiver').href = `../timecode.html?key=${encodeURIComponent(key)}`;
+      let context = null, source = null, timer = 0, startedAt = 0;
+      const stop = () => {
+        if (source) {
+          source.onended = null;
+          source.stop();
+        }
+        source = null;
+        context?.close();
+        context = null;
+        clearInterval(timer);
+        $('play').disabled = false;
+        $('stop').disabled = true;
+        $('status').textContent = 'Stopped';
+      };
+      $('play').onclick = async () => {
+        $('play').disabled = true;
+        try {
+          // Create and resume before yielding: iOS requires a user gesture.
+          context = new AudioContext({ sampleRate: 48000 });
+          await context.resume();
+          const buffer = context.createBuffer(1, context.sampleRate * 60, context.sampleRate);
+          const encoder = new TimecodeEncoder({ sampleRate: context.sampleRate, key, level: -24 });
+          encoder.render(buffer.getChannelData(0));
+          source = context.createBufferSource();
+          source.buffer = buffer;
+          source.connect(context.destination);
+          source.onended = stop;
+          startedAt = context.currentTime;
+          source.start(); // Do not loop: repeating would reset the shared timeline.
+          $('stop').disabled = false;
+          timer = setInterval(() => {
+            $('status').textContent = `Playing ${(context.currentTime - startedAt).toFixed(1)} / 60 s · key: ${key}`;
+          }, 100);
+        } catch (err) {
+          stop();
+          $('status').textContent = err.message;
+        }
+      };
+      $('stop').onclick = stop;
+    </script>
+  </body>
+</html>

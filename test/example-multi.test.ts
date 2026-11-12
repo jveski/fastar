@@ -9,7 +9,7 @@ import { multiScenarios } from '../src/sim/scene';
 import { percentile, runMultiScenario } from '../src/sim/harness';
 import type { GrayImage } from '../src/image/gray';
 
-const DIR = 'examples/multi';
+const DIR = 'site/demo/multi';
 const NAMES = ['amber', 'cobalt', 'jade', 'coral'];
 const W = 640, H = 360, FPS = 30, LOOP = 12;
 const DURATION = 3;

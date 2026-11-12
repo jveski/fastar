@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Audio timecode demo – fastar</title>
+    <link rel="stylesheet" href="../style.css" />
+    <link rel="stylesheet" href="demo.css" />
+    <style>
+      #clock { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; color: #fff; text-shadow: 0 0 4px #000; pointer-events: none; }
+      #time { font: 600 12vw ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+      #beat { width: 16px; height: 16px; border-radius: 50%; background: #fff; margin: 12px auto; opacity: 0.2; }
+      #video, #gl { display: none; }
+      body.camera #video, body.camera #gl { display: block; }
+    </style>
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <header>
+      <a href="https://github.com/jveski/fastar">fastar</a>
+      <a href="../compile.html">Compiler</a>
+      <a href="demos.html">All demos</a>
+    </header>
+    <main>
+      <h1>Audio timecode</h1>
+      <p><a id="sender" href="timecode/screen.html" target="_blank" rel="noopener">Play a minute of timecode</a>
+        on another device, then tap Listen here. Phones listening to the same sound show the same set time;
+        the small dot lights on each whole second.</p>
+      <p class="muted">The sweeps are at 19–20 kHz. Use speakers that reach 20 kHz; many laptop and phone
+        speakers cannot. Start at low volume. Do not turn it up just because you cannot hear it.
+        Microphone access needs HTTPS or localhost.</p>
+      <div class="row">
+        <label><input id="camera" type="checkbox" /> Also track an image</label>
+        <button id="start" disabled>Listen</button>
+        <span id="error" class="warn" role="alert"></span>
+      </div>
+      <p>With image tracking enabled, point at <a href="target.png" target="_blank" rel="noopener">this image</a>
+        on a second screen or printed 20 cm wide. The cube turns once every four seconds of the shared timeline,
+        using the time each camera frame was captured, not the time it is rendered.</p>
+      <p><a href="https://github.com/jveski/fastar/blob/main/site/demo/timecode.html">Receiver source</a> ·
+        <a href="https://github.com/jveski/fastar/blob/main/site/demo/timecode/screen.html">Player source</a></p>
+    </main>
+    <div id="ar">
+      <video id="video" muted playsinline></video>
+      <canvas id="gl"></canvas>
+      <div id="clock"><div id="time">–:––:––.–</div><div id="state">Listening…</div><div id="beat"></div></div>
+      <div id="controls"><button id="stop" class="secondary">Stop</button></div>
+      <pre id="status"></pre>
+    </div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter, TimecodeListener } from '../fastar.js';
+
+      const $ = (id) => document.getElementById(id);
+      const key = new URLSearchParams(location.search).get('key') ?? 'my-set';
+      $('sender').href = `timecode/screen.html?key=${encodeURIComponent(key)}`;
+
+      const canvas = $('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+      const cube = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0x2d7ff9 }));
+      cube.position.z = 0.03;
+
+      let ratio = Math.min(devicePixelRatio, 2), size = '';
+      const fit = () => {
+        const w = canvas.clientWidth, h = canvas.clientHeight, next = `${w}x${h}@${ratio}`;
+        if (next === size) return;
+        size = next;
+        renderer.setPixelRatio(ratio);
+        renderer.setSize(w, h, false);
+      };
+      const ar = await ImageTracker.create({ targets: './targets.bin' }).catch((err) => {
+        $('error').textContent = `Could not load the targets: ${err.message}`;
+        throw err;
+      });
+      ar.on('performance', (p) => { ratio = Math.min(p.pixelRatio, 2); });
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        render: ({ timecode }) => {
+          // FrameEvent.timecode belongs to the captured camera frame.
+          cube.rotation.z = timecode?.locked ? timecode.time * Math.PI / 2 : 0;
+          fit();
+          renderer.render(scene, camera);
+        },
+      });
+      three.anchor(0).add(cube);
+
+      const clock = (t) => {
+        const tenths = Math.floor(t * 10), seconds = Math.floor(tenths / 10);
+        return `${Math.floor(seconds / 3600)}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}.${tenths % 10}`;
+      };
+      let listener = null, animation = 0;
+      const frame = (now) => {
+        const time = listener?.timeAt(now), stats = listener?.stats;
+        $('time').textContent = time ? clock(time.time) : '–:––:––.–';
+        $('state').textContent = time?.locked ? `Locked ±${(time.std * 1000).toFixed(1)} ms` : 'Finding the time…';
+        $('beat').style.opacity = time?.locked && time.time % 1 < 0.08 ? '1' : '0.2';
+        $('status').textContent = stats
+          ? `${stats.sampleRate} Hz · microphone delay ${stats.latency.toFixed(0)} ms (${stats.latencySource})\n` +
+            `${(stats.clear * 100).toFixed(0)}% clear sweeps · ${stats.snr.toFixed(1)} dB · ${stats.symbols} symbols${stats.error ? `\n${stats.error}` : ''}`
+          : 'No microphone: image tracking can still run. Stop and check microphone permissions.';
+        animation = requestAnimationFrame(frame);
+      };
+      $('start').disabled = false;
+      $('start').onclick = async () => {
+        $('start').disabled = true;
+        $('stop').disabled = true;
+        $('error').textContent = '';
+        const useCamera = $('camera').checked;
+        document.body.classList.toggle('camera', useCamera);
+        document.body.classList.add('running');
+        try {
+          if (useCamera) {
+            // Starts camera and microphone together; timecode is attached to every frame.
+            await ar.start({ video: $('video'), timecode: { key }, requestMotionPermission: true, syncDisplay: true });
+            listener = ar.timecode;
+          } else {
+            // Constructed inside the tap: iOS audio must start from a user gesture.
+            listener = new TimecodeListener({ key });
+            await listener.start();
+          }
+          animation = requestAnimationFrame(frame);
+        } catch (err) {
+          listener?.stop();
+          ar.stop();
+          document.body.classList.remove('running', 'camera');
+          $('error').textContent = err.message;
+        } finally {
+          $('start').disabled = false;
+          $('stop').disabled = false;
+        }
+      };
+      $('stop').onclick = () => {
+        cancelAnimationFrame(animation);
+        listener?.stop();
+        listener = null;
+        ar.stop();
+        document.body.classList.remove('running', 'camera');
+      };
+    </script>
+  </body>
+</html>

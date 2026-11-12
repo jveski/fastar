@@ -59,7 +59,7 @@ export default defineConfig({
     },
     {
       name: 'camera-chromium',
-      testMatch: /camera\.spec\.ts/,
+      testMatch: /(camera|demos)\.spec\.ts/,
       use: {
         ...devices['Desktop Chrome'],
         launchOptions: { args: cameraArgs },

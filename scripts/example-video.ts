@@ -1,4 +1,4 @@
-// Generates the video example in examples/video: a looping generative
+// Generates the video demo in site/demo/video: a looping generative
 // "marbled ink" animation (clip.mp4, H.264 via ffmpeg), its targets.bin
 // (compiled from the encoded file, so the target matches what a screen
 // shows), and scene.json describing the swirl at the screen centre for the
@@ -8,7 +8,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { makeShowcaseClip } from '../src/sim/showcase';
 
-const OUT = 'examples/video';
+const OUT = 'site/demo/video';
 const WIDTH_M = 0.3; // shown about 30 cm wide (a laptop screen); change to your screen's width
 // The picture changes all the time, so every tracking point keeps needing new
 // snapshots: fewer points on screen at a time keep targets.bin small.

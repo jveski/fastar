@@ -1,4 +1,4 @@
-// Generates the bending-paper demo target for examples/paper: a printable PNG
+// Generates the bending-paper demo target in site/demo/paper: a printable PNG
 // with detail over the whole page (every part of a bending target must be
 // tracked to be shaped) and its compiled targets.bin.
 //   npx tsx scripts/example-paper.ts
@@ -9,7 +9,7 @@ import { encodeTargets } from '../src/target/format';
 import { encodeGrayPng } from '../cli/png';
 import { createGray } from '../src/image/gray';
 
-const OUT = 'examples/paper';
+const OUT = 'site/demo/paper';
 const WIDTH_M = 0.25; // print it 25 cm wide: fits landscape A4 or US Letter with margins
 
 mkdirSync(OUT, { recursive: true });

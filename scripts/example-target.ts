@@ -1,4 +1,4 @@
-// Generates the demo target for examples/basic: a printable PNG and its
+// Generates the image demo target: a printable PNG and its
 // compiled targets.bin.  npx tsx scripts/example-target.ts
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { makePoster } from '../src/sim/poster';
@@ -6,7 +6,7 @@ import { compileTarget } from '../src/target/compiler';
 import { encodeTargets } from '../src/target/format';
 import { encodeGrayPng } from '../cli/png';
 
-const OUT = 'examples/basic';
+const OUT = 'site/demo';
 const WIDTH_M = 0.2; // print it 20 cm wide (or measure it on your screen and change this)
 
 mkdirSync(OUT, { recursive: true });

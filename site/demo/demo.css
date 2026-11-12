@@ -1,0 +1,8 @@
+#target { width: 100%; display: block; border-radius: 6px; border: 1px solid var(--border); }
+#ar { display: none; }
+body.running { background: #000; overflow: hidden; }
+body.running header, body.running main { display: none; }
+body.running #ar { display: block; }
+#video, #gl { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+#controls { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: 12px; left: 12px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; color: #fff; }
+#status { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); color: #fff; font: 13px/1.5 ui-monospace, monospace; white-space: pre-wrap; text-shadow: 0 0 3px #000; pointer-events: none; }

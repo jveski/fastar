@@ -3,7 +3,9 @@
 Fast image-target AR for the mobile web.
 Works in iOS Safari and Android Chrome without WebXR.
 
-**[Live demo](https://jveski.github.io/fastar/demo/) · [Target compiler](https://jveski.github.io/fastar/compile.html)**
+**[Demos](https://jveski.github.io/fastar/demo/demos.html) · [Example source](site/demo) · [Target compiler](https://jveski.github.io/fastar/compile.html)**
+
+Each demo runs in the browser and links to its readable source: the demos are the examples.
 
 Shipped as a single ES module with no dependencies. Import it as below, or download [`fastar.js`](https://github.com/jveski/fastar/releases/latest/download/fastar.js) from the latest release.
 
@@ -24,7 +26,7 @@ Shipped as a single ES module with no dependencies. Import it as below, or downl
 
 ## Video targets
 
-Short looping videos work as targets too, and poses report where the video is in its playback. Nothing in the video needs to hold still: tracking works even when the whole picture keeps changing. [Demo](https://jveski.github.io/fastar/demo/video.html) · [example](examples/video)
+Short looping videos work as targets too, and poses report where the video is in its playback. Nothing in the video needs to hold still: tracking works even when the whole picture keeps changing. [Demo](https://jveski.github.io/fastar/demo/video.html) · [source](site/demo/video.html)
 
 ```sh
 npx fastar-compile -o targets.bin loop.mp4:1.2  # needs ffmpeg; or compileVideo() in the browser
@@ -39,7 +41,7 @@ ar.onFrame(({ poses }) => {
 
 ## Bending targets
 
-A printed page doesn't stay flat. Turn on `deformable` and each pose also carries the page's shape as it curls, flexes or lifts a corner. Any image target works; no special compilation is needed. [Demo](https://jveski.github.io/fastar/demo/paper.html) · [example](examples/paper)
+A printed page doesn't stay flat. Turn on `deformable` and each pose also carries the page's shape as it curls, flexes or lifts a corner. Any image target works; no special compilation is needed. [Demo](https://jveski.github.io/fastar/demo/paper.html) · [source](site/demo/paper.html)
 
 ```js
 const ar = await ImageTracker.create({ targets: './targets.bin', deformable: true });
@@ -56,7 +58,7 @@ Find the page while it is roughly flat, then bend it. Smooth bends work; creases
 
 ## Several targets
 
-Compile several images or videos into one file and every one of them is tracked, all at once. `poses` holds each target in view by its index, in the order they were compiled; `ar.targetIndex(name)` looks one up by name. [Example](examples/multi) (four videos on one screen)
+Compile several images or videos into one file and every one of them is tracked, all at once. `poses` holds each target in view by its index, in the order they were compiled; `ar.targetIndex(name)` looks one up by name. [Demo](https://jveski.github.io/fastar/demo/multi.html) · [source](site/demo/multi.html) (four videos on one screen, with content loaded on demand)
 
 ```sh
 npx fastar-compile -o targets.bin poster.png:0.42 cover.jpg:0.21 loop.mp4:1.2
@@ -79,20 +81,20 @@ The time spent tracking per camera frame is bounded (`budget: { trackMs }`, by d
 
 ## Audio timecode
 
-Share one timeline: a timecode encoded as sound, too high to hear (sweeps between 19 and 20 kHz). Turn on `timecode` and every frame carries the set time it was captured at. [Example](examples/timecode)
+Share one timeline: a timecode encoded as sound, too high to hear (sweeps between 19 and 20 kHz). Turn on `timecode` and every frame carries the set time it was captured at. [Demo](https://jveski.github.io/fastar/demo/timecode.html) · [source](site/demo/timecode.html)
 
 ```js
-await ar.start({ video, timecode: { key: 'my-set' } }); // asks for the microphone along with the camera
+await ar.start({ video, timecode: { key: 'my-set' } });
 ar.onFrame(({ timecode }) => {
-  if (timecode?.locked) console.log(timecode.time); // seconds into the set; timecode.std: its standard deviation
+  if (timecode?.locked) console.log(timecode.time);
 });
 ```
 
 Make the timecode with `fastar-timecode`, using the same key:
 
 ```sh
-npx fastar-timecode generate -o timecode.wav --duration 4h --key my-set   # play into the mix from the start of the set
-npx fastar-timecode mix -o out.wav set.wav --key my-set                   # or add it to recorded music
+npx fastar-timecode generate -o timecode.wav --duration 4h --key my-set
+npx fastar-timecode mix -o out.wav set.wav --key my-set
 ```
 
 Without image tracking, `TimecodeListener` listens on its own:
@@ -107,9 +109,9 @@ start.onclick = async () => {
 
 ## Slow devices
 
-Tracking adjusts itself to the phone it runs on. When it cannot keep up with every camera frame, it tracks every 2nd one, evenly, rather than whichever frames it happens to reach, and looking for targets not yet found takes less of the time.
+Tracking adjusts itself to the phone it runs on. When it cannot keep up with every camera frame, it tracks every 2nd one, evenly, rather than whichever frames it happens to reach, and looking for targets not yet found takes less of the time. [Demo](https://jveski.github.io/fastar/demo/performance.html) · [source](site/demo/performance.html)
 
-With `syncDisplay: true` (draw `FrameEvent.image` as the background, as the examples do) every camera frame is shown, at the camera's rate, with the pose measured on it. Frames are shown a steady delay after capture so that most have been tracked by then. The delay follows how long tracking takes on the device, is never more than `syncDisplay: { maxDelay }` (80 ms by default), and is zero while no target is in view.
+With `syncDisplay: true` (draw `FrameEvent.image` as the background, as the demos do) every camera frame is shown, at the camera's rate, with the pose measured on it. Frames are shown a steady delay after capture so that most have been tracked by then. The delay follows how long tracking takes on the device, is never more than `syncDisplay: { maxDelay }` (80 ms by default), and is zero while no target is in view.
 
 Rendering is up to the app, so the tracker gives hints. `ar.performance` says how hard the device is pressed (`level`, 0 to 3), what holds it back (`bottleneck`: `'render'`, `'tracking'` or `'none'`), and suggests a `pixelRatio` and a level of `effects` to render with. Apply them when they change:
 

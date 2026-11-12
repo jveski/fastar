@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Adaptive performance demo – fastar</title>
+    <link rel="stylesheet" href="../style.css" />
+    <link rel="stylesheet" href="demo.css" />
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+  </head>
+  <body>
+    <header>
+      <a href="https://github.com/jveski/fastar">fastar</a>
+      <a href="../compile.html">Compiler</a>
+      <a href="demos.html">All demos</a>
+    </header>
+    <main>
+      <h1>Slow devices &amp; synchronized display</h1>
+      <p>Show the image below on another screen or print it 20 cm wide. Start tracking, then increase
+        the extra work per frame. Watch the pixel ratio and optional particles step down as the page
+        becomes overloaded. Remove the load and give it a few seconds to recover.</p>
+      <p class="muted">The load slider deliberately blocks the main thread to simulate expensive app rendering;
+        it does not fake the tracker's measurements. A fast device may not need to reduce quality at low loads.</p>
+      <div class="row">
+        <label><input id="sync" type="checkbox" checked /> Synchronized display (maximum delay 80 ms)</label>
+        <button id="start" disabled>Start</button>
+        <span id="error" class="warn" role="alert"></span>
+      </div>
+      <p>With synchronized display, the background is <code>FrameEvent.image</code>, drawn by the three.js adapter
+        with that frame's pose. Stop, uncheck the option and restart to compare with the live video background.</p>
+      <img id="target" src="target.png" alt="Image target to print or display on another screen" />
+      <p><a href="https://github.com/jveski/fastar/blob/main/site/demo/performance.html">View source</a></p>
+    </main>
+    <div id="ar">
+      <video id="video" muted playsinline></video>
+      <canvas id="gl"></canvas>
+      <div id="controls">
+        <label>Extra work <input id="load" type="range" min="0" max="50" step="2" value="0" /> <output id="loadValue">0 ms</output></label>
+        <button id="stop" class="secondary">Stop</button>
+      </div>
+      <pre id="status"></pre>
+    </div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { ImageTracker, ThreeAdapter } from '../fastar.js';
+
+      const $ = (id) => document.getElementById(id);
+      const canvas = $('gl');
+      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+      const ar = await ImageTracker.create({ targets: './targets.bin' }).catch((err) => {
+        $('error').textContent = `Could not load the targets: ${err.message}`;
+        throw err;
+      });
+
+      const cube = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0x2d7ff9 }));
+      cube.position.z = 0.03;
+      const particles = new THREE.Group();
+      const geometry = new THREE.SphereGeometry(0.002, 8, 6);
+      const material = new THREE.MeshStandardMaterial({ color: 0xffbb33 });
+      for (let i = 0; i < 80; i++) {
+        const particle = new THREE.Mesh(geometry, material);
+        const angle = i * Math.PI * 2 / 80;
+        particle.position.set(Math.cos(angle) * 0.075, Math.sin(angle) * 0.075, 0.02 + (i % 5) * 0.006);
+        particles.add(particle);
+      }
+
+      let ratio = Math.min(devicePixelRatio, 2), size = '', extraWork = 0;
+      const fit = () => {
+        const w = canvas.clientWidth, h = canvas.clientHeight, next = `${w}x${h}@${ratio}`;
+        if (next === size) return;
+        size = next;
+        renderer.setPixelRatio(ratio);
+        renderer.setSize(w, h, false);
+      };
+      // Rendering policy belongs to the app: follow both hints, not just the pixel ratio.
+      const applyPerformance = (p) => {
+        ratio = Math.min(p.pixelRatio, 2);
+        const count = p.effects === 'full' ? 80 : p.effects === 'reduced' ? 24 : 0;
+        particles.children.forEach((particle, i) => { particle.visible = i < count; });
+      };
+      ar.on('performance', applyPerformance);
+      applyPerformance(ar.performance);
+      const three = new ThreeAdapter(ar, {
+        THREE, scene, camera,
+        viewSize: () => [canvas.clientWidth, canvas.clientHeight],
+        render: ({ presentedFrame }) => {
+          particles.rotation.z = presentedFrame.captureTime / 2000;
+          // Deliberate, bounded synthetic load, counted as part of frame handling.
+          const until = performance.now() + extraWork;
+          while (performance.now() < until) { /* simulate expensive rendering */ }
+          fit();
+          renderer.render(scene, camera);
+        },
+      });
+      three.anchor(0).add(cube, particles);
+      $('load').oninput = () => {
+        extraWork = Number($('load').value);
+        $('loadValue').textContent = `${extraWork} ms`;
+      };
+
+      let timer = 0;
+      $('start').disabled = false;
+      $('start').onclick = async () => {
+        $('error').textContent = '';
+        $('stop').disabled = true;
+        // The adapter only replaces the background when a frame carries pixels.
+        // Clear the old texture when restarting with live video instead.
+        scene.background = null;
+        document.body.classList.add('running');
+        try {
+          await ar.start({
+            video: $('video'), requestMotionPermission: true,
+            syncDisplay: $('sync').checked ? { maxDelay: 80 } : false,
+          });
+        } catch (err) {
+          ar.stop();
+          document.body.classList.remove('running');
+          $('error').textContent = err.message;
+          return;
+        } finally {
+          $('stop').disabled = false;
+        }
+        timer = setInterval(() => {
+          const p = ar.performance, s = ar.stats;
+          $('status').textContent = [
+            s.targets.length ? 'Tracking' : 'Looking for the image…',
+            `Level ${p.level} · bottleneck: ${p.bottleneck} · pixel ratio ${ratio.toFixed(1)} · effects: ${p.effects}`,
+            `Camera interval ${p.frameInterval.toFixed(1)} ms · tracking every ${p.stride} frame(s)`,
+            `Page busy ${(p.mainBusy * 100).toFixed(0)}% · acquisition busy ${(p.acquireBusy * 100).toFixed(0)}%`,
+            `Display delay ${p.displayDelay.toFixed(1)} ms · late poses ${(p.displayLate * 100).toFixed(0)}% · late display frames ${(p.jank * 100).toFixed(0)}%`,
+          ].join('\n');
+        }, 250);
+      };
+      $('stop').onclick = () => {
+        ar.stop();
+        clearInterval(timer);
+        document.body.classList.remove('running');
+      };
+    </script>
+  </body>
+</html>

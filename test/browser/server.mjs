@@ -5,12 +5,14 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
 
 const ROOT = resolve('test/browser/public');
+const SITE = resolve('dist/site');
 const PORT = Number(process.env.PORT ?? 4173);
 const HOST = process.env.HOST ?? '127.0.0.1';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.mp4': 'video/mp4',
   '.y4m': 'video/x-yuv4mpeg',
@@ -21,8 +23,10 @@ const MIME = {
 
 function safePath(url) {
   const path = decodeURIComponent((url ?? '/').split('?')[0]);
-  const p = normalize(join(ROOT, path));
-  return p.startsWith(ROOT) ? p : null;
+  const site = path.startsWith('/site/');
+  const root = site ? SITE : ROOT;
+  const p = normalize(join(root, site ? path.slice('/site/'.length) : path));
+  return p === root || p.startsWith(root + '/') ? p : null;
 }
 
 const server = createServer((req, res) => {
