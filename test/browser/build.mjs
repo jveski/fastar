@@ -29,11 +29,15 @@ await esbuild.build({
 });
 
 copyFileSync('test/browser/harness.html', `${OUT}/index.html`);
+copyFileSync('test/browser/timecode.html', `${OUT}/timecode.html`);
 copyFileSync('dist/fastar.js', `${OUT}/fastar.js`);
 cpSync('test/browser/fixtures/data', `${OUT}/fixtures`, { recursive: true });
 if (existsSync('test/browser/fixtures/golden')) {
   cpSync('test/browser/fixtures/golden', `${OUT}/fixtures/golden`, { recursive: true });
 }
+
+// Audio timecode from set time 100 s, for the timecode spec (also Chromium's fake microphone).
+execFileSync('node', ['dist/fastar-timecode.js', 'generate', '-o', `${OUT}/fixtures/timecode.wav`, '-d', '40', '--start', '100'], { stdio: 'inherit' });
 
 // Chromium's fake camera needs Y4M. It is large, so generate it into the
 // served directory instead of committing it; the camera spec skips if absent.

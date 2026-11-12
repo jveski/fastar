@@ -16,6 +16,7 @@ const MIME = {
   '.y4m': 'video/x-yuv4mpeg',
   '.png': 'image/png',
   '.bin': 'application/octet-stream',
+  '.wav': 'audio/wav',
 };
 
 function safePath(url) {

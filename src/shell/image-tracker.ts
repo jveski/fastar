@@ -1,5 +1,4 @@
 // Public main-thread API.
-import workerSource from 'virtual:worker-source';
 import { decodeTargets, type TargetMeta } from '../target/format';
 import { glProjection, intrinsicsFromFocal, lookupHfov, intrinsicsFromFov, poseToGl, type FitMode, type Intrinsics } from '../vision/camera';
 import { ImuBuffer } from '../fusion/imu';
@@ -19,6 +18,8 @@ import { AccelSigns } from '../fusion/gravity';
 import { ContentManager, type ContentOptions } from './content';
 import { DisplayPacer, type PacedFrame } from './pacer';
 import { Governor, deviceStartLevel, type PerformanceState } from './governor';
+import { spawnWorker } from './spawn';
+import { TIMECODE_AUDIO, TimecodeListener, type ListenOptions, type SetTime } from './timecode';
 
 export interface CreateOptions {
   /** URL of a compiled targets file, or its bytes. */
@@ -98,6 +99,12 @@ export interface StartOptions {
    * they arrive. Draw `image` instead of showing the <video> element.
    */
   syncDisplay?: boolean | SyncDisplayOptions;
+  /**
+   * Listen for the set's audio timecode through the microphone (asked for
+   * along with the camera): each frame then carries the set time it was
+   * captured at (FrameEvent.timecode). Options must match the generator's.
+   */
+  timecode?: boolean | ListenOptions;
 }
 
 export interface SyncDisplayOptions {
@@ -150,6 +157,8 @@ export interface FrameEvent {
   poses: Map<number, Pose>;
   /** With syncDisplay: this frame's pixels, to draw as the background. Reused, so draw it now. */
   image?: HTMLCanvasElement | OffscreenCanvas;
+  /** With timecode: the set time this frame was captured at, once the timecode has been heard. */
+  timecode?: SetTime;
 }
 
 /** A camera frame waiting to be shown (syncDisplay). */
@@ -277,6 +286,7 @@ export class ImageTracker {
   private readonly up = new Float64Array(3);
   /** The accelerometer's sign convention, from its own readings (for Pose.gravity). */
   private readonly accelSigns = new AccelSigns();
+  private tc: TimecodeListener | null = null;
 
   private constructor(buffer: ArrayBuffer, o: CreateOptions) {
     this.buffer = buffer;
@@ -308,6 +318,9 @@ export class ImageTracker {
       : o.requestMotionPermission !== false && o.useImu !== false
         ? MotionSensors.requestPermissionState()
         : Promise.resolve('not-requested');
+    // The audio context too must be started inside the gesture.
+    const tcOptions = o.timecode && !o.replay ? (o.timecode === true ? {} : o.timecode) : null;
+    this.tc = tcOptions ? new TimecodeListener(tcOptions) : null;
     // iOS shows one permission prompt at a time: opening the camera while the
     // motion prompt is up leaves getUserMedia hanging (black video), so let
     // the motion prompt settle first. Neither the camera nor muted inline
@@ -335,7 +348,7 @@ export class ImageTracker {
       video.src = typeof o.replay.video === 'string' ? o.replay.video : URL.createObjectURL(o.replay.video);
     } else {
       this.ownsStream = !o.stream;
-      this.stream = o.stream ?? (await openCamera(facing).catch((e) => { throw stepError('camera access', e); }));
+      this.stream = o.stream ?? (await this.openCameraAndMic(facing));
       video.srcObject = this.stream;
     }
     await video.play().catch((e) => { throw stepError('video playback', e); });
@@ -383,6 +396,23 @@ export class ImageTracker {
     if (settings?.frameRate && settings.frameRate > 0) this.setCameraInterval(1000 / settings.frameRate);
     this.scheduleFrame();
     if (typeof requestAnimationFrame === 'function') this.rafHandle = requestAnimationFrame(this.onAnimationFrame);
+    this.tc?.start(this.stream?.getAudioTracks().length ? this.stream : undefined).catch((e) => console.warn((e as Error).message));
+  }
+
+  /** The camera, with the microphone when listening for timecode (one prompt); camera only if the microphone is refused. */
+  private async openCameraAndMic(facing: Facing): Promise<MediaStream> {
+    if (this.tc) {
+      try {
+        return await openCamera(facing, TIMECODE_AUDIO);
+      } catch (e) {
+        console.warn(`fastar: no microphone for the timecode (${(e as Error).message}); camera only`);
+      }
+    }
+    return openCamera(facing).catch((e) => {
+      this.tc?.stop();
+      this.tc = null;
+      throw stepError('camera access', e);
+    });
   }
 
   stop(): void {
@@ -391,6 +421,7 @@ export class ImageTracker {
     if (this.rafHandle && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.rafHandle);
     this.rafHandle = 0;
     this.sensors?.stop();
+    this.tc?.stop();
     clearInterval(this.replayTimer);
     this.tracker?.terminate();
     this.acquirer?.terminate();
@@ -502,6 +533,16 @@ export class ImageTracker {
     return { time: videoTimeFromOffset(c.offset, c.duration, captureTime / 1000), std: c.std, locked: c.locked, duration: c.duration };
   }
 
+  /** The timecode listener (StartOptions.timecode), for its stats and lock events. */
+  get timecode(): TimecodeListener | null {
+    return this.tc;
+  }
+
+  /** With timecode: the set time at `captureTime` (ms, e.g. FrameEvent.presentedFrame.captureTime), or null before it is heard. */
+  timecodeAt(captureTime: number): SetTime | null {
+    return this.tc?.timeAt(captureTime) ?? null;
+  }
+
   /** Low level: target pose for a frame captured at `captureTime` (ms). */
   poseAt(index: number, captureTime: number, R: Float64Array, t: Float64Array): boolean {
     const p = this.predictors.get(index);
@@ -520,15 +561,8 @@ export class ImageTracker {
   // --- internals ---
 
   private spawnWorkers(useImu: boolean, width: number, height: number): void {
-    const make = () => {
-      if (this.o.workerUrl) return new Worker(this.o.workerUrl);
-      const url = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
-      const w = new Worker(url);
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-      return w;
-    };
-    this.tracker = make();
-    this.acquirer = make();
+    this.tracker = spawnWorker(this.o.workerUrl);
+    this.acquirer = spawnWorker(this.o.workerUrl);
     const ch = new MessageChannel();
     const K = this.intrinsics!;
     // Worker errors are otherwise invisible: the tracker recovers, but no
@@ -823,6 +857,8 @@ export class ImageTracker {
       poses,
       image,
     };
+    const tc = this.tc?.timeAt(captureTime);
+    if (tc) ev.timecode = tc;
     this.frameListeners.forEach((cb) => cb(ev));
   }
 

@@ -52,6 +52,8 @@ const trackMs = Number(p.get('trackMs') ?? 0) || undefined;
 const playbackRate = Number(p.get('rate') ?? 1);
 // A slow device's tracker: the worker spends about this long (ms) more on each frame, varying +/-30%.
 const slowWorker = Number(p.get('slowWorker') ?? 0);
+// Camera mode: also listen for the audio timecode (the fake microphone plays it).
+const timecode = p.get('timecode') === '1';
 
 /** Create options shared by every mode. */
 function createOptions(): Omit<CreateOptions, 'targets'> {
@@ -200,6 +202,7 @@ function attach(ar: ImageTracker, frames: FrameSample[], events: HarnessResult['
       poses,
       view: [targetVideo.clientWidth, targetVideo.clientHeight],
       projection: Array.from(ar.projectionMatrix),
+      timecode: e.timecode ? { time: e.timecode.time, std: e.timecode.std, locked: e.timecode.locked } : undefined,
     });
   });
 }
@@ -309,7 +312,8 @@ async function startLive(): Promise<void> {
 
   let clearImu = () => {};
   if (mode === 'camera') {
-    await ar.start({ video: targetVideo, requestMotionPermission: true, useImu, forceCopyPath: forceCopy, syncDisplay: sync, hfov: HFOV });
+    // The fake microphone cannot hear the page's output, so there is no loopback to measure.
+    await ar.start({ video: targetVideo, requestMotionPermission: true, useImu, forceCopyPath: forceCopy, syncDisplay: sync, hfov: HFOV, timecode: timecode && { calibrate: false } });
   } else {
     const stream = await openSyntheticStream();
     const log = await fetchJson<SessionLog>(`${scenario}.session.json`);

@@ -102,7 +102,7 @@ export class Recorder {
     if (stream && !o.noVideo && typeof MediaRecorder !== 'undefined') {
       const types = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
       this.mime = types.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
-      this.mr = new MediaRecorder(stream, this.mime ? { mimeType: this.mime } : undefined);
+      this.mr = new MediaRecorder(new MediaStream(stream.getVideoTracks()), this.mime ? { mimeType: this.mime } : undefined);
       this.mr.ondataavailable = (e) => { if (e.data.size) this.chunks.push(e.data); };
       this.mr.start(1000);
     }

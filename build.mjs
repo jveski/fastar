@@ -1,6 +1,7 @@
 // Builds:
 //   dist/fastar.js          single-file ESM library (worker code inlined)
 //   dist/fastar-compile.js  Node CLI target compiler
+//   dist/fastar-timecode.js Node CLI audio timecode generator and checker
 //   dist/types/             type declarations
 //   dist/bench/             on-device benchmark page
 //   dist/site/              GitHub Pages site: target compiler and demo
@@ -65,6 +66,17 @@ await esbuild.build({
   format: 'esm',
   target: 'node18',
   outfile: 'dist/fastar-compile.js',
+  banner: { js: '#!/usr/bin/env node' },
+  plugins,
+});
+
+await esbuild.build({
+  entryPoints: ['cli/timecode.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node18',
+  outfile: 'dist/fastar-timecode.js',
   banner: { js: '#!/usr/bin/env node' },
   plugins,
 });

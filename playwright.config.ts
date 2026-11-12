@@ -7,6 +7,12 @@ const cameraArgs = [
   '--use-fake-device-for-media-stream',
   ...(existsSync(fakeVideo) ? [`--use-file-for-fake-video-capture=${fakeVideo}`] : []),
 ];
+const micArgs = [
+  '--use-fake-ui-for-media-stream',
+  '--use-fake-device-for-media-stream',
+  '--use-file-for-fake-audio-capture=test/browser/public/fixtures/timecode.wav',
+  ...(existsSync(fakeVideo) ? [`--use-file-for-fake-video-capture=${fakeVideo}`] : []),
+];
 
 export default defineConfig({
   testDir: './test/browser/specs',
@@ -57,6 +63,14 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         launchOptions: { args: cameraArgs },
+      },
+    },
+    {
+      name: 'audio-chromium',
+      testMatch: /timecode\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: { args: micArgs },
       },
     },
   ],

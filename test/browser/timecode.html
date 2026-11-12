@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>fastar timecode harness</title>
+  </head>
+  <body>
+    <button id="start">Start</button>
+    <script type="module">
+      // Listens for the timecode in /fixtures/timecode.wav (set time 100 s
+      // onwards): played into a stream here, or, with ?mic=1, through the
+      // microphone (Chromium's fake capture plays the file).
+      import { TimecodeListener } from '/fastar.js';
+
+      const q = new URLSearchParams(location.search);
+      const r = (window.__timecode = { done: false, logs: [], samples: [] });
+      document.getElementById('start').onclick = async () => {
+        try {
+          // Both audio contexts are made inside the click. The page's own output never
+          // reaches this "microphone", so loopback calibration (?calibrate=1) cannot succeed.
+          const tc = new TimecodeListener(q.get('calibrate') === '1' ? {} : { latency: 0 });
+          let stream;
+          if (q.get('mic') !== '1') {
+            const ctx = new AudioContext({ sampleRate: 48000 });
+            const data = await (await fetch('/fixtures/timecode.wav')).arrayBuffer();
+            const src = ctx.createBufferSource();
+            src.buffer = await ctx.decodeAudioData(data);
+            src.loop = true;
+            const dest = ctx.createMediaStreamDestination();
+            src.connect(dest);
+            src.start();
+            stream = dest.stream;
+          }
+          await tc.start(stream);
+          const t0 = performance.now(), limit = Number(q.get('ms') || 30000);
+          let locked = 0;
+          while (performance.now() - t0 < limit && locked < 12) {
+            await new Promise((res) => setTimeout(res, 250));
+            const t = tc.time, s = tc.stats;
+            r.samples.push({
+              at: performance.now(), time: t ? t.time : null, std: t ? t.std : null, locked: !!(t && t.locked),
+              clear: s.clear, snr: s.snr, sampleRate: s.sampleRate, error: s.error, calibration: s.calibration, latencySource: s.latencySource,
+            });
+            if (t && t.locked) locked++;
+          }
+          tc.stop();
+        } catch (e) {
+          r.logs.push(String((e && e.message) || e));
+        }
+        r.done = true;
+      };
+    </script>
+  </body>
+</html>

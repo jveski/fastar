@@ -18,6 +18,12 @@ describe('bundled worker', () => {
     };
     vm.runInNewContext(src, { self, performance, MessageChannel, setTimeout, console, TextDecoder, TextEncoder, Math, Float64Array });
     expect(typeof self.onmessage).toBe('function');
+    // The timecode role (a worker of its own in the page).
+    const audio = new MessageChannel();
+    self.onmessage!({ data: { type: 'init-timecode', options: {}, sampleRate: 48000, port: audio.port2 } });
+    expect(posted.splice(0).map((m) => m.type)).toEqual(['timecode-ready']);
+    audio.port1.close();
+    audio.port2.close();
     const ch = new MessageChannel();
     self.onmessage!({
       data: {

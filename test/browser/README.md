@@ -47,6 +47,9 @@ exists on the repository's default branch.
   slowed to take longer than a camera frame (`slowWorker=<ms>` wraps the
   worker script with a busy wait per frame).
 - **`getUserMedia`** via Chromium's fake camera file (`camera-chromium`).
+- **Audio timecode**: `TimecodeListener` locks onto a generated timecode WAV
+  played into a WebAudio stream (every engine), and through the microphone
+  via Chromium's fake audio capture (`audio-chromium`).
 - **Sensors**: synthetic `devicemotion` fed through `MotionSensors`, plus the
   vision-only permission-denied path.
 - **Recorder round trip**: record a live canvas stream with `MediaRecorder`,

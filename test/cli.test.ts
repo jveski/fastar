@@ -8,6 +8,8 @@ import { decodePng } from '../cli/png';
 import { getPoster } from './fixtures';
 import { decodeTargets } from '../src/target/format';
 import { makeMotionClip } from '../src/sim/motion';
+import { makeMusic } from '../src/sim/audio';
+import { WavReader, WavWriter } from '../cli/wav';
 
 function crc32(b: Uint8Array): number {
   let c = ~0;
@@ -133,5 +135,70 @@ describe('fastar-compile CLI, video', () => {
     expect(t.meta.video!.frameCount).toBe(60);
     expect(t.meta.video!.changes).toEqual(clip.cuts);
     expect(t.meta.video!.report.minPoints).toBeGreaterThan(20);
+  });
+});
+
+describe('fastar-timecode CLI', () => {
+  const run = (args: string[], input?: Buffer) => spawnSync('npx', ['tsx', 'cli/timecode.ts', ...args], { encoding: input ? 'buffer' : 'utf8', input, maxBuffer: 1 << 26 });
+  const report = (args: string[]) => {
+    const r = run([...args, '--json']);
+    return { status: r.status, json: JSON.parse(r.stdout as string) };
+  };
+
+  it('generates timecode that decodes to its set time', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fastar-'));
+    const wav = join(dir, 'tc.wav');
+    const out = run(['generate', '-o', wav, '-d', '20', '--start', '1:00:00', '--key', 'club']);
+    expect(out.status).toBe(0);
+    expect(out.stdout).toMatch(/0:00:20.000 of timecode from set time 1:00:00.000, 48000 Hz, key "club"/);
+    const r = new WavReader(wav);
+    expect(r.info).toEqual({ sampleRate: 48000, channels: 1, format: 'pcm16', frames: 20 * 48000 });
+    r.close();
+    const ok = report(['decode', wav, '--key', 'club']);
+    expect(ok.status).toBe(0);
+    expect(ok.json.found).toBe(true);
+    expect(ok.json.lockedAtEnd).toBe(true);
+    expect(Math.abs(ok.json.startTime - 3600)).toBeLessThan(0.001);
+    expect(ok.json.lockedAfter).toBeLessThan(8);
+    // Another event's listeners hear nothing.
+    const other = report(['decode', wav]);
+    expect(other.status).toBe(2);
+    expect(other.json.found).toBe(false);
+  });
+
+  it('mixes timecode into music, following its level', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fastar-'));
+    const music = makeMusic(48000, 20, 5);
+    const w = new WavWriter(join(dir, 'set.wav'), 48000, 2, 'pcm24');
+    const l = music.map((v) => 0.3 * v), r = music.map((v) => -0.3 * v);
+    w.write([l, r]);
+    w.close();
+    const out = run(['mix', '-o', join(dir, 'out.wav'), join(dir, 'set.wav'), '--start', '90']);
+    expect(out.status).toBe(0);
+    expect(out.stdout).toMatch(/timecode on 100% of the time, at -[0-9.]+ dBFS on average/);
+    const mixed = new WavReader(join(dir, 'out.wav'));
+    expect(mixed.info).toEqual({ sampleRate: 48000, channels: 2, format: 'pcm24', frames: 20 * 48000 });
+    const ch = mixed.read(48000 * 20)!;
+    mixed.close();
+    // The music is untouched below the timecode's band: what was added is small.
+    let peak = 0;
+    for (let i = 0; i < l.length; i++) peak = Math.max(peak, Math.abs(ch[0][i] - l[i]));
+    expect(20 * Math.log10(peak)).toBeLessThan(-18 + 0.1);
+    const d = report(['decode', join(dir, 'out.wav')]);
+    expect(Math.abs(d.json.startTime - 90)).toBeLessThan(0.001);
+  });
+
+  it('mixes a live raw stream', () => {
+    const n = 48000 * 2, x = new Float32Array(2 * n);
+    const music = makeMusic(48000, 2, 6);
+    for (let i = 0; i < n; i++) x[2 * i] = x[2 * i + 1] = 0.3 * music[i];
+    const r = run(['mix', '--raw', '--rate', '48000', '--channels', '2'], Buffer.from(x.buffer));
+    expect(r.status).toBe(0);
+    const y = new Float32Array(new Uint8Array(r.stdout as Buffer).slice().buffer);
+    expect(y.length).toBe(x.length);
+    let diff = 0;
+    for (let i = 0; i < y.length; i++) diff = Math.max(diff, Math.abs(y[i] - x[i]));
+    expect(diff).toBeGreaterThan(1e-4);
+    expect(diff).toBeLessThan(0.13);
   });
 });

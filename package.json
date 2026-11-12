@@ -28,11 +28,13 @@
     }
   },
   "bin": {
-    "fastar-compile": "./dist/fastar-compile.js"
+    "fastar-compile": "./dist/fastar-compile.js",
+    "fastar-timecode": "./dist/fastar-timecode.js"
   },
   "files": [
     "dist/fastar.js",
     "dist/fastar-compile.js",
+    "dist/fastar-timecode.js",
     "dist/types"
   ],
   "engines": {
@@ -51,6 +53,7 @@
     "test:browser:android": "tsx test/browser/runners/android.ts",
     "test:browser:ios": "tsx test/browser/runners/ios-sim.ts",
     "compile": "tsx cli/compile.ts",
+    "timecode": "tsx cli/timecode.ts",
     "example:target": "tsx scripts/example-target.ts",
     "prepublishOnly": "npm run check"
   },

@@ -77,6 +77,34 @@ Without three.js, `ar.content({ load, unload, show, hide })` does the same for a
 
 The time spent tracking per camera frame is bounded (`budget: { trackMs }`, by default 60% of the frame interval), so a slow phone does not fall behind as targets come into view. Every target in view is still tracked: the most prominent ones (largest, wholly in view, nearest the centre) keep full resolution, and the others are tracked with fewer points, or on fewer frames, when time runs short. `ar.setPriority(index, weight)` favours a target, and `ar.stats.targets` shows each target's priority, points and update rate. `maxTrack` limits how many targets are tracked at once.
 
+## Audio timecode
+
+Share one timeline: a timecode encoded as sound, too high to hear (sweeps between 19 and 20 kHz). Turn on `timecode` and every frame carries the set time it was captured at. [Example](examples/timecode)
+
+```js
+await ar.start({ video, timecode: { key: 'my-set' } }); // asks for the microphone along with the camera
+ar.onFrame(({ timecode }) => {
+  if (timecode?.locked) console.log(timecode.time); // seconds into the set; timecode.std: its standard deviation
+});
+```
+
+Make the timecode with `fastar-timecode`, using the same key:
+
+```sh
+npx fastar-timecode generate -o timecode.wav --duration 4h --key my-set   # play into the mix from the start of the set
+npx fastar-timecode mix -o out.wav set.wav --key my-set                   # or add it to recorded music
+```
+
+Without image tracking, `TimecodeListener` listens on its own:
+
+```js
+start.onclick = async () => {
+  const tc = new TimecodeListener({ key: 'my-set' }); // in the tap: iOS only starts audio from a gesture
+  await tc.start();
+  tc.on('lock', () => console.log(tc.time)); // tc.timeAt(performance.now() ms) for any moment
+};
+```
+
 ## Slow devices
 
 Tracking adjusts itself to the phone it runs on. When it cannot keep up with every camera frame, it tracks every 2nd one, evenly, rather than whichever frames it happens to reach, and looking for targets not yet found takes less of the time.

@@ -3,10 +3,10 @@
 import { rgbaToGray } from '../image/gray';
 import type { Facing } from './sensors';
 
-export async function openCamera(facing: Facing): Promise<MediaStream> {
+export async function openCamera(facing: Facing, audio?: MediaTrackConstraints): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('fastar: camera access is not available (needs HTTPS)');
   return navigator.mediaDevices.getUserMedia({
-    audio: false,
+    audio: audio ?? false,
     video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
   });
 }

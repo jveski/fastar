@@ -26,6 +26,8 @@ export interface FrameSample {
   /** Video element size in CSS pixels. */
   view: [number, number];
   projection: number[];
+  /** With timecode: the set time at the frame's capture. */
+  timecode?: { time: number; std: number; locked: boolean };
 }
 
 export interface StatsSample {
